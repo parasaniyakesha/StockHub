@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ProjectModuleManager">
+    <modules>
+      <module fileurl="file://$PROJECT_DIR$/.idea/StockHub.iml" filepath="$PROJECT_DIR$/.idea/StockHub.iml" />
+      <module fileurl="file://$PROJECT_DIR$/app/windows/flutter/ephemeral/.plugin_symlinks/jni/android/android.iml" filepath="$PROJECT_DIR$/app/windows/flutter/ephemeral/.plugin_symlinks/jni/android/android.iml" />
+      <module fileurl="file://$PROJECT_DIR$/app/linux/flutter/ephemeral/.plugin_symlinks/jni/android/android2.iml" filepath="$PROJECT_DIR$/app/linux/flutter/ephemeral/.plugin_symlinks/jni/android/android2.iml" />
+      <module fileurl="file://$PROJECT_DIR$/app/windows/flutter/ephemeral/.plugin_symlinks/file_saver/android/android3.iml" filepath="$PROJECT_DIR$/app/windows/flutter/ephemeral/.plugin_symlinks/file_saver/android/android3.iml" />
+      <module fileurl="file://$PROJECT_DIR$/app/linux/flutter/ephemeral/.plugin_symlinks/file_saver/android/android4.iml" filepath="$PROJECT_DIR$/app/linux/flutter/ephemeral/.plugin_symlinks/file_saver/android/android4.iml" />
+      <module fileurl="file://$PROJECT_DIR$/app/linux/flutter/ephemeral/.plugin_symlinks/file_saver/example/example.iml" filepath="$PROJECT_DIR$/app/linux/flutter/ephemeral/.plugin_symlinks/file_saver/example/example.iml" />
+      <module fileurl="file://$PROJECT_DIR$/app/windows/flutter/ephemeral/.plugin_symlinks/file_saver/example/example2.iml" filepath="$PROJECT_DIR$/app/windows/flutter/ephemeral/.plugin_symlinks/file_saver/example/example2.iml" />
+      <module fileurl="file://$PROJECT_DIR$/app/windows/flutter/ephemeral/.plugin_symlinks/jni/java/jni.iml" filepath="$PROJECT_DIR$/app/windows/flutter/ephemeral/.plugin_symlinks/jni/java/jni.iml" />
+      <module fileurl="file://$PROJECT_DIR$/app/linux/flutter/ephemeral/.plugin_symlinks/jni/java/jni2.iml" filepath="$PROJECT_DIR$/app/linux/flutter/ephemeral/.plugin_symlinks/jni/java/jni2.iml" />
+      <module fileurl="file://$PROJECT_DIR$/app/windows/flutter/ephemeral/.plugin_symlinks/jni/example/android/app/src/main/kotlin/kotlin.iml" filepath="$PROJECT_DIR$/app/windows/flutter/ephemeral/.plugin_symlinks/jni/example/android/app/src/main/kotlin/kotlin.iml" />
+      <module fileurl="file://$PROJECT_DIR$/app/linux/flutter/ephemeral/.plugin_symlinks/jni/example/android/app/src/main/kotlin/kotlin2.iml" filepath="$PROJECT_DIR$/app/linux/flutter/ephemeral/.plugin_symlinks/jni/example/android/app/src/main/kotlin/kotlin2.iml" />
+      <module fileurl="file://$PROJECT_DIR$/app/windows/flutter/ephemeral/.plugin_symlinks/jni/example/android/app/src/main/main.iml" filepath="$PROJECT_DIR$/app/windows/flutter/ephemeral/.plugin_symlinks/jni/example/android/app/src/main/main.iml" />
+      <module fileurl="file://$PROJECT_DIR$/app/linux/flutter/ephemeral/.plugin_symlinks/jni/example/android/app/src/main/main2.iml" filepath="$PROJECT_DIR$/app/linux/flutter/ephemeral/.plugin_symlinks/jni/example/android/app/src/main/main2.iml" />
+    </modules>
+  </component>
+</project>

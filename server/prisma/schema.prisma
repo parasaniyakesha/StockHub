@@ -1,0 +1,690 @@
+// StockHub - Company Product Management System
+// PostgreSQL schema managed by Prisma.
+//
+// Stock accounting rule: quantities in WarehouseStock / StoreStock are a cached
+// balance. Every change to them MUST be written together with a StockMovement
+// row inside the same database transaction (see src/services/stockLedger.service.ts).
+
+generator client {
+  provider      = "prisma-client-js"
+  // rhel-openssl-3.0.x is the Vercel serverless runtime.
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // Non-pooled connection used by `prisma migrate` (Neon / Vercel Postgres).
+  directUrl = env("DIRECT_URL")
+}
+
+// ─────────────────────────────── Enums ───────────────────────────────
+
+enum Role {
+  ADMIN
+  MANAGER
+  STORE
+}
+
+enum RecordStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum StockBucket {
+  AVAILABLE
+  DAMAGED
+}
+
+enum MovementType {
+  OPENING
+  PURCHASE
+  TRANSFER_IN
+  TRANSFER_OUT
+  SALE
+  RETURN
+  DAMAGE
+  ADJUSTMENT
+  PACKING
+  CANCELLATION
+}
+
+enum ProductRequestStatus {
+  DRAFT
+  SUBMITTED
+  UNDER_REVIEW
+  APPROVED
+  PARTIALLY_APPROVED
+  REJECTED
+  PACKED
+  DISPATCHED
+  RECEIVED
+  COMPLETED
+  CANCELLED
+}
+
+enum PackingOrderStatus {
+  DRAFT
+  ASSIGNED
+  PACKING
+  PACKED
+  DISPATCHED
+  RECEIVED
+  COMPLETED
+  CANCELLED
+}
+
+enum PackingStoreStatus {
+  PENDING
+  DISPATCHED
+  RECEIVED
+  CANCELLED
+}
+
+enum TransferStatus {
+  REQUESTED
+  APPROVED
+  DISPATCHED
+  RECEIVED
+  COMPLETED
+  REJECTED
+  CANCELLED
+}
+
+enum LocationType {
+  WAREHOUSE
+  STORE
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  UPI
+  BANK_TRANSFER
+  CREDIT
+  OTHER
+}
+
+enum SaleStatus {
+  COMPLETED
+  CANCELLED
+}
+
+enum ReturnCondition {
+  GOOD
+  DAMAGED
+}
+
+// ─────────────────────────────── Identity ───────────────────────────────
+
+model User {
+  id           String       @id @default(uuid())
+  name         String
+  email        String       @unique
+  phone        String?
+  passwordHash String
+  role         Role
+  status       RecordStatus @default(ACTIVE)
+  // Store users belong to exactly one store. Null for ADMIN / MANAGER.
+  storeId      String?
+  store        Store?       @relation("StoreUsers", fields: [storeId], references: [id])
+  // Manager-only configurable permission keys (see src/config/permissions.ts).
+  permissions  String[]     @default([])
+  lastLoginAt  DateTime?
+  // Bumped on password change / forced logout; embedded in access tokens.
+  tokenVersion Int          @default(0)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  managedStores       Store[]              @relation("StoreManager")
+  refreshTokens       RefreshToken[]
+  passwordResetTokens PasswordResetToken[]
+  notifications       Notification[]
+  auditLogs           AuditLog[]
+  stockMovements      StockMovement[]
+  sales               Sale[]
+  returns             SaleReturn[]
+
+  @@index([role])
+  @@index([storeId])
+  @@map("users")
+}
+
+model RefreshToken {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  replacedBy String?
+  userAgent  String?
+  ipAddress  String?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+// ─────────────────────────────── Catalog ───────────────────────────────
+
+model Category {
+  id          String       @id @default(uuid())
+  name        String
+  code        String       @unique
+  description String?
+  parentId    String?
+  parent      Category?    @relation("CategoryTree", fields: [parentId], references: [id])
+  children    Category[]   @relation("CategoryTree")
+  status      RecordStatus @default(ACTIVE)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  products Product[]
+
+  @@index([parentId])
+  @@map("categories")
+}
+
+model Product {
+  id            String       @id @default(uuid())
+  name          String
+  sku           String       @unique
+  barcode       String?      @unique
+  categoryId    String
+  category      Category     @relation(fields: [categoryId], references: [id])
+  brand         String?
+  unit          String       @default("PCS")
+  description   String?
+  purchasePrice Decimal      @db.Decimal(12, 2)
+  sellingPrice  Decimal      @db.Decimal(12, 2)
+  taxRate       Decimal      @default(0) @db.Decimal(5, 2)
+  minimumStock  Int          @default(0)
+  maximumStock  Int?
+  imageUrl      String?
+  status        RecordStatus @default(ACTIVE)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  warehouseStock     WarehouseStock[]
+  storeStock         StoreStock[]
+  storeAvailability  StoreAvailability[]
+  stockMovements     StockMovement[]
+  saleItems          SaleItem[]
+  requestItems       ProductRequestItem[]
+  packingItems       PackingOrderItem[]
+  packingAllocations PackingOrderStoreItem[]
+  transferItems      StockTransferItem[]
+  returnItems        SaleReturnItem[]
+
+  @@index([categoryId])
+  @@index([status])
+  @@index([name])
+  @@map("products")
+}
+
+// ─────────────────────────────── Locations ───────────────────────────────
+
+model Store {
+  id                String       @id @default(uuid())
+  name              String
+  code              String       @unique
+  address           String?
+  city              String?
+  phone             String?
+  email             String?
+  contactPerson     String?
+  status            RecordStatus @default(ACTIVE)
+  assignedManagerId String?
+  assignedManager   User?        @relation("StoreManager", fields: [assignedManagerId], references: [id])
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  users             User[]                @relation("StoreUsers")
+  stock             StoreStock[]
+  availability      StoreAvailability[]
+  stockMovements    StockMovement[]
+  sales             Sale[]
+  returns           SaleReturn[]
+  productRequests   ProductRequest[]
+  packingStores     PackingOrderStore[]
+  transfersOut      StockTransfer[]       @relation("TransferFromStore")
+  transfersIn       StockTransfer[]       @relation("TransferToStore")
+
+  @@index([assignedManagerId])
+  @@index([status])
+  @@map("stores")
+}
+
+model Warehouse {
+  id        String       @id @default(uuid())
+  name      String
+  code      String       @unique
+  address   String?
+  isDefault Boolean      @default(false)
+  status    RecordStatus @default(ACTIVE)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  stock          WarehouseStock[]
+  stockMovements StockMovement[]
+  packingOrders  PackingOrder[]
+  transfersOut   StockTransfer[]
+
+  @@map("warehouses")
+}
+
+// ─────────────────────────────── Stock ───────────────────────────────
+
+model WarehouseStock {
+  id               String    @id @default(uuid())
+  warehouseId      String
+  warehouse        Warehouse @relation(fields: [warehouseId], references: [id])
+  productId        String
+  product          Product   @relation(fields: [productId], references: [id])
+  quantity         Int       @default(0)
+  // Quantity allocated to assigned packing orders / approved transfers that
+  // has not physically left the warehouse yet. available = quantity - reserved.
+  reservedQuantity Int       @default(0)
+  damagedQuantity  Int       @default(0)
+  updatedAt        DateTime  @updatedAt
+
+  @@unique([warehouseId, productId])
+  @@index([productId])
+  @@map("warehouse_stock")
+}
+
+model StoreStock {
+  id               String   @id @default(uuid())
+  storeId          String
+  store            Store    @relation(fields: [storeId], references: [id])
+  productId        String
+  product          Product  @relation(fields: [productId], references: [id])
+  quantity         Int      @default(0)
+  // Reserved for approved outgoing transfers not yet dispatched.
+  reservedQuantity Int      @default(0)
+  damagedQuantity  Int      @default(0)
+  updatedAt        DateTime @updatedAt
+
+  @@unique([storeId, productId])
+  @@index([productId])
+  @@map("store_stock")
+}
+
+// Quantities a store declares as physically available (self-reported).
+// Informational only - does not change the stock ledger.
+model StoreAvailability {
+  id            String   @id @default(uuid())
+  storeId       String
+  store         Store    @relation(fields: [storeId], references: [id])
+  productId     String
+  product       Product  @relation(fields: [productId], references: [id])
+  quantity      Int
+  notes         String?
+  submittedById String
+  updatedAt     DateTime @updatedAt
+  createdAt     DateTime @default(now())
+
+  @@unique([storeId, productId])
+  @@index([productId])
+  @@map("store_availability")
+}
+
+model StockMovement {
+  id            String       @id @default(uuid())
+  productId     String
+  product       Product      @relation(fields: [productId], references: [id])
+  storeId       String?
+  store         Store?       @relation(fields: [storeId], references: [id])
+  warehouseId   String?
+  warehouse     Warehouse?   @relation(fields: [warehouseId], references: [id])
+  type          MovementType
+  bucket        StockBucket  @default(AVAILABLE)
+  // Signed: positive adds stock, negative removes stock.
+  quantity      Int
+  balanceAfter  Int
+  referenceType String?
+  referenceId   String?
+  reason        String?
+  createdById   String
+  createdBy     User         @relation(fields: [createdById], references: [id])
+  createdAt     DateTime     @default(now())
+
+  @@index([productId, createdAt])
+  @@index([storeId, createdAt])
+  @@index([warehouseId, createdAt])
+  @@index([referenceType, referenceId])
+  @@index([type])
+  @@map("stock_movements")
+}
+
+// ─────────────────────────────── Product requests ───────────────────────────────
+
+model ProductRequest {
+  id              String               @id @default(uuid())
+  requestNumber   String               @unique
+  storeId         String
+  store           Store                @relation(fields: [storeId], references: [id])
+  status          ProductRequestStatus @default(DRAFT)
+  notes           String?
+  reviewNotes     String?
+  clientRequestId String?              @unique
+  createdById     String
+  reviewedById    String?
+  submittedAt     DateTime?
+  reviewedAt      DateTime?
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+
+  items         ProductRequestItem[]
+  packingOrders PackingOrderStore[]
+
+  @@index([storeId, status])
+  @@index([status])
+  @@map("product_requests")
+}
+
+model ProductRequestItem {
+  id                String         @id @default(uuid())
+  requestId         String
+  request           ProductRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  productId         String
+  product           Product        @relation(fields: [productId], references: [id])
+  requestedQuantity Int
+  approvedQuantity  Int?
+  notes             String?
+
+  allocations PackingOrderStoreItem[]
+
+  @@unique([requestId, productId])
+  @@map("product_request_items")
+}
+
+// ─────────────────────────────── Packing orders ───────────────────────────────
+
+model PackingOrder {
+  id           String             @id @default(uuid())
+  orderNumber  String             @unique
+  warehouseId  String
+  warehouse    Warehouse          @relation(fields: [warehouseId], references: [id])
+  status       PackingOrderStatus @default(DRAFT)
+  notes        String?
+  createdById  String
+  assignedAt   DateTime?
+  packedAt     DateTime?
+  dispatchedAt DateTime?
+  completedAt  DateTime?
+  cancelledAt  DateTime?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  items  PackingOrderItem[]
+  stores PackingOrderStore[]
+
+  @@index([status])
+  @@map("packing_orders")
+}
+
+model PackingOrderItem {
+  id             String       @id @default(uuid())
+  packingOrderId String
+  packingOrder   PackingOrder @relation(fields: [packingOrderId], references: [id], onDelete: Cascade)
+  productId      String
+  product        Product      @relation(fields: [productId], references: [id])
+  // Planned total quantity for this product across all stores.
+  quantity       Int
+
+  @@unique([packingOrderId, productId])
+  @@map("packing_order_items")
+}
+
+model PackingOrderStore {
+  id             String             @id @default(uuid())
+  packingOrderId String
+  packingOrder   PackingOrder       @relation(fields: [packingOrderId], references: [id], onDelete: Cascade)
+  storeId        String
+  store          Store              @relation(fields: [storeId], references: [id])
+  requestId      String?
+  request        ProductRequest?    @relation(fields: [requestId], references: [id])
+  status         PackingStoreStatus @default(PENDING)
+  dispatchedAt   DateTime?
+  receivedAt     DateTime?
+  receivedById   String?
+  receiptNotes   String?
+
+  items PackingOrderStoreItem[]
+
+  @@unique([packingOrderId, storeId])
+  @@index([storeId, status])
+  @@map("packing_order_stores")
+}
+
+// Per-store, per-product allocation line of a packing order.
+model PackingOrderStoreItem {
+  id                 String              @id @default(uuid())
+  packingOrderStoreId String
+  packingOrderStore  PackingOrderStore   @relation(fields: [packingOrderStoreId], references: [id], onDelete: Cascade)
+  productId          String
+  product            Product             @relation(fields: [productId], references: [id])
+  requestItemId      String?
+  requestItem        ProductRequestItem? @relation(fields: [requestItemId], references: [id])
+  requestedQuantity  Int                 @default(0)
+  approvedQuantity   Int                 @default(0)
+  allocatedQuantity  Int
+  packedQuantity     Int                 @default(0)
+  dispatchedQuantity Int                 @default(0)
+  receivedQuantity   Int                 @default(0)
+  damagedQuantity    Int                 @default(0)
+
+  @@unique([packingOrderStoreId, productId])
+  @@map("packing_order_store_items")
+}
+
+// ─────────────────────────────── Transfers ───────────────────────────────
+
+model StockTransfer {
+  id              String         @id @default(uuid())
+  transferNumber  String         @unique
+  sourceType      LocationType
+  fromWarehouseId String?
+  fromWarehouse   Warehouse?     @relation(fields: [fromWarehouseId], references: [id])
+  fromStoreId     String?
+  fromStore       Store?         @relation("TransferFromStore", fields: [fromStoreId], references: [id])
+  toStoreId       String
+  toStore         Store          @relation("TransferToStore", fields: [toStoreId], references: [id])
+  status          TransferStatus @default(REQUESTED)
+  notes           String?
+  rejectionReason String?
+  clientRequestId String?        @unique
+  requestedById   String
+  approvedById    String?
+  dispatchedById  String?
+  receivedById    String?
+  approvedAt      DateTime?
+  dispatchedAt    DateTime?
+  receivedAt      DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  items StockTransferItem[]
+
+  @@index([status])
+  @@index([fromStoreId])
+  @@index([toStoreId])
+  @@map("stock_transfers")
+}
+
+model StockTransferItem {
+  id                 String        @id @default(uuid())
+  transferId         String
+  transfer           StockTransfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  productId          String
+  product            Product       @relation(fields: [productId], references: [id])
+  requestedQuantity  Int
+  approvedQuantity   Int?
+  dispatchedQuantity Int           @default(0)
+  receivedQuantity   Int           @default(0)
+  damagedQuantity    Int           @default(0)
+
+  @@unique([transferId, productId])
+  @@map("stock_transfer_items")
+}
+
+// ─────────────────────────────── Sales & returns ───────────────────────────────
+
+model Sale {
+  id              String        @id @default(uuid())
+  invoiceNumber   String        @unique
+  storeId         String
+  store           Store         @relation(fields: [storeId], references: [id])
+  customerName    String?
+  customerPhone   String?
+  subtotal        Decimal       @db.Decimal(14, 2)
+  discount        Decimal       @default(0) @db.Decimal(14, 2)
+  tax             Decimal       @default(0) @db.Decimal(14, 2)
+  grandTotal      Decimal       @db.Decimal(14, 2)
+  paymentMethod   PaymentMethod
+  status          SaleStatus    @default(COMPLETED)
+  notes           String?
+  clientRequestId String?       @unique
+  createdById     String
+  createdBy       User          @relation(fields: [createdById], references: [id])
+  cancelledAt     DateTime?
+  cancelReason    String?
+  createdAt       DateTime      @default(now())
+
+  items   SaleItem[]
+  returns SaleReturn[]
+
+  @@index([storeId, createdAt])
+  @@index([createdAt])
+  @@map("sales")
+}
+
+model SaleItem {
+  id        String  @id @default(uuid())
+  saleId    String
+  sale      Sale    @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+  quantity  Int
+  unitPrice Decimal @db.Decimal(12, 2)
+  discount  Decimal @default(0) @db.Decimal(12, 2)
+  taxRate   Decimal @default(0) @db.Decimal(5, 2)
+  tax       Decimal @default(0) @db.Decimal(12, 2)
+  total     Decimal @db.Decimal(14, 2)
+
+  returnItems SaleReturnItem[]
+
+  @@index([saleId])
+  @@index([productId])
+  @@map("sale_items")
+}
+
+model SaleReturn {
+  id              String   @id @default(uuid())
+  returnNumber    String   @unique
+  storeId         String
+  store           Store    @relation(fields: [storeId], references: [id])
+  saleId          String?
+  sale            Sale?    @relation(fields: [saleId], references: [id])
+  notes           String?
+  refundAmount    Decimal  @default(0) @db.Decimal(14, 2)
+  clientRequestId String?  @unique
+  createdById     String
+  createdBy       User     @relation(fields: [createdById], references: [id])
+  createdAt       DateTime @default(now())
+
+  items SaleReturnItem[]
+
+  @@index([storeId, createdAt])
+  @@map("returns")
+}
+
+model SaleReturnItem {
+  id         String          @id @default(uuid())
+  returnId   String
+  saleReturn SaleReturn      @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  productId  String
+  product    Product         @relation(fields: [productId], references: [id])
+  saleItemId String?
+  saleItem   SaleItem?       @relation(fields: [saleItemId], references: [id])
+  quantity   Int
+  condition  ReturnCondition
+  reason     String
+  unitPrice  Decimal         @default(0) @db.Decimal(12, 2)
+
+  @@index([returnId])
+  @@index([productId])
+  @@map("return_items")
+}
+
+// ─────────────────────────────── Platform ───────────────────────────────
+
+model Notification {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type       String
+  title      String
+  message    String
+  entityType String?
+  entityId   String?
+  readAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt])
+  @@map("notifications")
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  action    String
+  module    String
+  recordId  String?
+  summary   String?
+  oldValue  Json?
+  newValue  Json?
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  @@index([module, createdAt])
+  @@index([userId, createdAt])
+  @@index([recordId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("settings")
+}
+
+// Atomic document-number sequences (REQ-1001, PO-1001, INV-...).
+model Counter {
+  key   String @id
+  value Int    @default(0)
+
+  @@map("counters")
+}
