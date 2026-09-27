@@ -65,9 +65,12 @@ export async function listStock(context: RequestContext, q: StockListQuery): Pro
       ...(q.hideZero ? { OR: [{ quantity: { not: 0 } }, { damagedQuantity: { not: 0 } }] } : {}),
     };
     if (q.lowStock) {
-      const ids = await prisma.$queryRaw<{ id: string }[]>`
-        SELECT w.id FROM warehouse_stock w JOIN products p ON p.id = w."productId" WHERE w.quantity <= p."minimumStock"`;
-      where.id = { in: ids.map((r) => r.id) };
+      const ws = await prisma.warehouseStock.findMany({
+        where: q.warehouseId ? { warehouseId: q.warehouseId } : {},
+        select: { id: true, quantity: true, product: { select: { minimumStock: true } } },
+      });
+      const ids = ws.filter((w) => w.quantity <= w.product.minimumStock).map((w) => w.id);
+      where.id = { in: ids };
     }
     const [rows, total] = await Promise.all([
       prisma.warehouseStock.findMany({
@@ -87,9 +90,13 @@ export async function listStock(context: RequestContext, q: StockListQuery): Pro
     ...(q.hideZero ? { OR: [{ quantity: { not: 0 } }, { damagedQuantity: { not: 0 } }] } : {}),
   };
   if (q.lowStock) {
-    const ids = await prisma.$queryRaw<{ id: string }[]>`
-      SELECT s.id FROM store_stock s JOIN products p ON p.id = s."productId" WHERE s.quantity <= p."minimumStock"`;
-    where.id = { in: ids.map((r) => r.id) };
+    const filterStoreId = storeFilter(context.scope, q.storeId);
+    const ss = await prisma.storeStock.findMany({
+      where: filterStoreId ? { storeId: filterStoreId } : {},
+      select: { id: true, quantity: true, product: { select: { minimumStock: true } } },
+    });
+    const ids = ss.filter((s) => s.quantity <= s.product.minimumStock).map((s) => s.id);
+    where.id = { in: ids };
   }
   const [rows, total] = await Promise.all([
     prisma.storeStock.findMany({

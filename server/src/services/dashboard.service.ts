@@ -1,8 +1,8 @@
-import { PackingOrderStatus, Prisma, ProductRequestStatus, RecordStatus, Role, TransferStatus } from '@prisma/client';
+import { PackingOrderStatus, ProductRequestStatus, RecordStatus, Role, TransferStatus } from '@prisma/client';
 import { prisma } from '../utils/prisma';
 import { RequestContext } from '../types/auth';
 import { getSettings } from './settings.service';
-import { localTs, reportStoreIds, storeSql, storeWhere } from './reportScope';
+import { reportStoreIds, storeWhere } from './reportScope';
 
 const PENDING_REQUESTS: ProductRequestStatus[] = [ProductRequestStatus.SUBMITTED, ProductRequestStatus.UNDER_REVIEW];
 const OPEN_PACKING: PackingOrderStatus[] = [
@@ -17,65 +17,85 @@ const OPEN_TRANSFERS: TransferStatus[] = [TransferStatus.REQUESTED, TransferStat
 /** Role-aware dashboard: admin = company-wide, manager = assigned stores, store = own store. */
 export async function getDashboard(context: RequestContext, q: { storeId?: string }) {
   const settings = await getSettings();
-  const tz = settings.timezone;
   const storeIds = await reportStoreIds(context, q);
   const isAdmin = context.user.role === Role.ADMIN && !q.storeId;
-  const saleStores = storeSql('s."storeId"', storeIds);
+  const storeFilter = storeWhere(storeIds);
 
-  const [salesToday, salesMonth, trend, storeSales, topProducts, movementTrend] = await Promise.all([
-    prisma.$queryRaw<{ total: Prisma.Decimal | null; count: bigint }[]>`
-      SELECT COALESCE(SUM(s."grandTotal"),0) AS total, COUNT(*) AS count FROM sales s
-      WHERE s.status = 'COMPLETED' AND ${saleStores}
-        AND ${localTs('s."createdAt"', tz)}::date = (now() AT TIME ZONE ${tz})::date`,
-    prisma.$queryRaw<{ total: Prisma.Decimal | null; count: bigint }[]>`
-      SELECT COALESCE(SUM(s."grandTotal"),0) AS total, COUNT(*) AS count FROM sales s
-      WHERE s.status = 'COMPLETED' AND ${saleStores}
-        AND date_trunc('month', ${localTs('s."createdAt"', tz)}) = date_trunc('month', now() AT TIME ZONE ${tz})`,
-    prisma.$queryRaw<{ day: Date; total: Prisma.Decimal; count: bigint }[]>`
-      SELECT d.day::date AS day, COALESCE(SUM(s."grandTotal"),0) AS total, COUNT(s.id) AS count
-      FROM generate_series((now() AT TIME ZONE ${tz})::date - 29, (now() AT TIME ZONE ${tz})::date, interval '1 day') AS d(day)
-      LEFT JOIN sales s ON ${localTs('s."createdAt"', tz)}::date = d.day::date AND s.status = 'COMPLETED' AND ${saleStores}
-      GROUP BY d.day ORDER BY d.day`,
-    prisma.$queryRaw<{ storeId: string; name: string; total: Prisma.Decimal; count: bigint }[]>`
-      SELECT st.id AS "storeId", st.name, COALESCE(SUM(s."grandTotal"),0) AS total, COUNT(s.id) AS count
-      FROM sales s JOIN stores st ON st.id = s."storeId"
-      WHERE s.status = 'COMPLETED' AND ${saleStores}
-        AND date_trunc('month', ${localTs('s."createdAt"', tz)}) = date_trunc('month', now() AT TIME ZONE ${tz})
-      GROUP BY st.id, st.name ORDER BY total DESC LIMIT 10`,
-    prisma.$queryRaw<{ productId: string; name: string; sku: string; quantity: bigint; total: Prisma.Decimal }[]>`
-      SELECT p.id AS "productId", p.name, p.sku, SUM(si.quantity) AS quantity, SUM(si.total) AS total
-      FROM sale_items si JOIN sales s ON s.id = si."saleId" JOIN products p ON p.id = si."productId"
-      WHERE s.status = 'COMPLETED' AND ${saleStores}
-        AND ${localTs('s."createdAt"', tz)} >= (now() AT TIME ZONE ${tz}) - interval '30 days'
-      GROUP BY p.id, p.name, p.sku ORDER BY quantity DESC LIMIT 10`,
-    prisma.$queryRaw<{ day: Date; inbound: bigint; outbound: bigint }[]>`
-      SELECT d.day::date AS day,
-        COALESCE(SUM(CASE WHEN m.quantity > 0 THEN m.quantity END),0) AS inbound,
-        COALESCE(SUM(CASE WHEN m.quantity < 0 THEN -m.quantity END),0) AS outbound
-      FROM generate_series((now() AT TIME ZONE ${tz})::date - 13, (now() AT TIME ZONE ${tz})::date, interval '1 day') AS d(day)
-      LEFT JOIN stock_movements m ON ${localTs('m."createdAt"', tz)}::date = d.day::date AND m.bucket = 'AVAILABLE'
-        AND ${isAdmin ? Prisma.sql`TRUE` : storeSql('m."storeId"', storeIds)}
-      GROUP BY d.day ORDER BY d.day`,
-  ]);
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const thirtyDaysAgo = new Date(todayStart.getTime() - 29 * 86_400_000);
+  const fourteenDaysAgo = new Date(todayStart.getTime() - 13 * 86_400_000);
 
-  const storeStockWhere = storeWhere(storeIds);
-  const [storeUnits, warehouseUnits, lowStoreRows, lowWarehouse, pendingRequests, packing, transfers, stores, products] = await Promise.all([
-    prisma.storeStock.aggregate({ where: storeStockWhere, _sum: { quantity: true, damagedQuantity: true } }),
+  const [
+    salesTodayAgg,
+    salesMonthAgg,
+    recentSales,
+    monthSales,
+    recentSaleItems,
+    recentMovements,
+    storeUnits,
+    warehouseUnits,
+    storeStockItems,
+    whStock,
+    pendingRequests,
+    packing,
+    transfers,
+    stores,
+    products,
+  ] = await Promise.all([
+    prisma.sale.aggregate({
+      where: { status: 'COMPLETED', ...storeFilter, createdAt: { gte: todayStart } },
+      _sum: { grandTotal: true },
+      _count: true,
+    }),
+    prisma.sale.aggregate({
+      where: { status: 'COMPLETED', ...storeFilter, createdAt: { gte: monthStart } },
+      _sum: { grandTotal: true },
+      _count: true,
+    }),
+    prisma.sale.findMany({
+      where: { status: 'COMPLETED', ...storeFilter, createdAt: { gte: thirtyDaysAgo } },
+      select: { createdAt: true, grandTotal: true },
+    }),
+    prisma.sale.findMany({
+      where: { status: 'COMPLETED', ...storeFilter, createdAt: { gte: monthStart } },
+      include: { store: { select: { id: true, name: true } } },
+    }),
+    prisma.saleItem.findMany({
+      where: {
+        sale: { status: 'COMPLETED', ...storeFilter, createdAt: { gte: thirtyDaysAgo } },
+      },
+      include: { product: { select: { id: true, name: true, sku: true } } },
+    }),
+    prisma.stockMovement.findMany({
+      where: {
+        bucket: 'AVAILABLE',
+        createdAt: { gte: fourteenDaysAgo },
+        ...(isAdmin ? {} : storeFilter),
+      },
+      select: { createdAt: true, quantity: true },
+    }),
+    prisma.storeStock.aggregate({ where: storeFilter, _sum: { quantity: true, damagedQuantity: true } }),
     isAdmin ? prisma.warehouseStock.aggregate({ _sum: { quantity: true, reservedQuantity: true } }) : Promise.resolve(null),
-    prisma.$queryRaw<{ storeId: string; storeName: string; productId: string; name: string; sku: string; quantity: number; minimumStock: number }[]>`
-      SELECT st.id AS "storeId", st.name AS "storeName", p.id AS "productId", p.name, p.sku, ss.quantity, p."minimumStock"
-      FROM store_stock ss JOIN products p ON p.id = ss."productId" JOIN stores st ON st.id = ss."storeId"
-      WHERE p.status = 'ACTIVE' AND st.status = 'ACTIVE' AND ss.quantity <= p."minimumStock" AND ${storeSql('ss."storeId"', storeIds)}
-      ORDER BY (ss.quantity - p."minimumStock") ASC LIMIT 200`,
+    prisma.storeStock.findMany({
+      where: {
+        ...storeFilter,
+        store: { status: 'ACTIVE' },
+        product: { status: 'ACTIVE' },
+      },
+      include: {
+        product: { select: { id: true, name: true, sku: true, minimumStock: true } },
+        store: { select: { id: true, name: true } },
+      },
+    }),
     isAdmin
-      ? prisma.$queryRaw<{ productId: string; name: string; sku: string; quantity: number; minimumStock: number }[]>`
-          SELECT p.id AS "productId", p.name, p.sku, COALESCE(SUM(w.quantity),0)::int AS quantity, p."minimumStock"
-          FROM products p LEFT JOIN warehouse_stock w ON w."productId" = p.id
-          WHERE p.status = 'ACTIVE'
-          GROUP BY p.id HAVING COALESCE(SUM(w.quantity),0) <= p."minimumStock"
-          ORDER BY COALESCE(SUM(w.quantity),0) - p."minimumStock" ASC LIMIT 200`
+      ? prisma.warehouseStock.findMany({
+          where: { product: { status: 'ACTIVE' } },
+          include: { product: { select: { id: true, name: true, sku: true, minimumStock: true } } },
+        })
       : Promise.resolve([]),
-    prisma.productRequest.count({ where: { ...storeStockWhere, status: { in: PENDING_REQUESTS } } }),
+    prisma.productRequest.count({ where: { ...storeFilter, status: { in: PENDING_REQUESTS } } }),
     prisma.packingOrder.count({
       where: {
         status: { in: context.user.role === Role.STORE ? OPEN_PACKING.filter((s) => s !== PackingOrderStatus.DRAFT) : OPEN_PACKING },
@@ -91,6 +111,92 @@ export async function getDashboard(context: RequestContext, q: { storeId?: strin
     prisma.store.count({ where: { status: RecordStatus.ACTIVE, ...(storeIds === null ? {} : { id: { in: storeIds } }) } }),
     prisma.product.count({ where: { status: RecordStatus.ACTIVE } }),
   ]);
+
+  // Daily sales trend (30 days)
+  const trendMap = new Map<string, { day: Date; total: number; count: number }>();
+  for (let i = 0; i < 30; i++) {
+    const d = new Date(thirtyDaysAgo.getTime() + i * 86_400_000);
+    const key = d.toISOString().slice(0, 10);
+    trendMap.set(key, { day: d, total: 0, count: 0 });
+  }
+  for (const s of recentSales) {
+    const key = s.createdAt.toISOString().slice(0, 10);
+    const entry = trendMap.get(key);
+    if (entry) {
+      entry.total += Number(s.grandTotal);
+      entry.count += 1;
+    }
+  }
+  const trend = Array.from(trendMap.values());
+
+  // Store sales breakdown this month
+  const storeSalesMap = new Map<string, { storeId: string; name: string; total: number; count: number }>();
+  for (const s of monthSales) {
+    const sid = s.storeId;
+    const entry = storeSalesMap.get(sid) ?? { storeId: sid, name: s.store.name, total: 0, count: 0 };
+    entry.total += Number(s.grandTotal);
+    entry.count += 1;
+    storeSalesMap.set(sid, entry);
+  }
+  const storeSales = Array.from(storeSalesMap.values()).sort((a, b) => b.total - a.total).slice(0, 10);
+
+  // Top products (last 30 days)
+  const topProdMap = new Map<string, { productId: string; name: string; sku: string; quantity: number; total: number }>();
+  for (const item of recentSaleItems) {
+    const pid = item.productId;
+    const entry = topProdMap.get(pid) ?? { productId: pid, name: item.product.name, sku: item.product.sku, quantity: 0, total: 0 };
+    entry.quantity += item.quantity;
+    entry.total += Number(item.total);
+    topProdMap.set(pid, entry);
+  }
+  const topProducts = Array.from(topProdMap.values()).sort((a, b) => b.quantity - a.quantity).slice(0, 10);
+
+  // Stock movements trend (last 14 days)
+  const moveMap = new Map<string, { day: Date; inbound: number; outbound: number }>();
+  for (let i = 0; i < 14; i++) {
+    const d = new Date(fourteenDaysAgo.getTime() + i * 86_400_000);
+    const key = d.toISOString().slice(0, 10);
+    moveMap.set(key, { day: d, inbound: 0, outbound: 0 });
+  }
+  for (const m of recentMovements) {
+    const key = m.createdAt.toISOString().slice(0, 10);
+    const entry = moveMap.get(key);
+    if (entry) {
+      if (m.quantity > 0) entry.inbound += m.quantity;
+      else if (m.quantity < 0) entry.outbound += -m.quantity;
+    }
+  }
+  const movementTrend = Array.from(moveMap.values());
+
+  // Low stock calculation
+  const lowStoreRows = storeStockItems
+    .filter((ss) => ss.quantity <= ss.product.minimumStock)
+    .map((ss) => ({
+      storeId: ss.storeId,
+      storeName: ss.store.name,
+      productId: ss.productId,
+      name: ss.product.name,
+      sku: ss.product.sku,
+      quantity: ss.quantity,
+      minimumStock: ss.product.minimumStock,
+    }))
+    .sort((a, b) => a.quantity - a.minimumStock - (b.quantity - b.minimumStock))
+    .slice(0, 200);
+
+  let lowWarehouse: { productId: string; name: string; sku: string; quantity: number; minimumStock: number }[] = [];
+  if (isAdmin) {
+    const whProdMap = new Map<string, { productId: string; name: string; sku: string; quantity: number; minimumStock: number }>();
+    for (const w of whStock) {
+      const pid = w.productId;
+      const entry = whProdMap.get(pid) ?? { productId: pid, name: w.product.name, sku: w.product.sku, quantity: 0, minimumStock: w.product.minimumStock };
+      entry.quantity += w.quantity;
+      whProdMap.set(pid, entry);
+    }
+    lowWarehouse = Array.from(whProdMap.values())
+      .filter((w) => w.quantity <= w.minimumStock)
+      .sort((a, b) => a.quantity - a.minimumStock - (b.quantity - b.minimumStock))
+      .slice(0, 200);
+  }
 
   const warehouseQty = warehouseUnits?._sum.quantity ?? 0;
   const lowStockProducts = isAdmin
@@ -112,16 +218,16 @@ export async function getDashboard(context: RequestContext, q: { storeId?: strin
       pendingRequests,
       pendingPackingOrders: packing,
       pendingTransfers: transfers,
-      todaySales: salesToday[0]?.total ?? 0,
-      todayInvoices: Number(salesToday[0]?.count ?? 0),
-      monthlySales: salesMonth[0]?.total ?? 0,
-      monthlyInvoices: Number(salesMonth[0]?.count ?? 0),
+      todaySales: salesTodayAgg._sum.grandTotal ?? 0,
+      todayInvoices: salesTodayAgg._count,
+      monthlySales: salesMonthAgg._sum.grandTotal ?? 0,
+      monthlyInvoices: salesMonthAgg._count,
     },
     charts: {
-      salesTrend: trend.map((t) => ({ date: t.day, total: t.total, invoices: Number(t.count) })),
-      storeSales: storeSales.map((s) => ({ storeId: s.storeId, name: s.name, total: s.total, invoices: Number(s.count) })),
-      topProducts: topProducts.map((p) => ({ ...p, quantity: Number(p.quantity) })),
-      stockMovement: movementTrend.map((m) => ({ date: m.day, inbound: Number(m.inbound), outbound: Number(m.outbound) })),
+      salesTrend: trend.map((t) => ({ date: t.day, total: t.total, invoices: t.count })),
+      storeSales: storeSales.map((s) => ({ storeId: s.storeId, name: s.name, total: s.total, invoices: s.count })),
+      topProducts: topProducts.map((p) => ({ ...p, quantity: p.quantity })),
+      stockMovement: movementTrend.map((m) => ({ date: m.day, inbound: m.inbound, outbound: m.outbound })),
       lowStockProducts: lowStockProducts.slice(0, 10),
     },
     currency: { code: settings.currencyCode, symbol: settings.currencySymbol },

@@ -11,7 +11,7 @@ class AppConfig {
   /// REST API base URL (including the `/api` prefix).
   static const String apiBaseUrl = String.fromEnvironment(
     'API_BASE_URL',
-    defaultValue: 'http://localhost:4000/api',
+    defaultValue: 'https://stockhub-bfrt.onrender.com/api',
   );
 
   static const String environment = String.fromEnvironment('APP_ENV', defaultValue: 'development');

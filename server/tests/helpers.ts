@@ -8,15 +8,36 @@ import { DEFAULT_MANAGER_PERMISSIONS } from '../src/config/permissions';
 export const api = () => request(app);
 export const PASSWORD = 'Test@12345';
 
-const TABLES = [
-  'notifications', 'audit_logs', 'stock_movements', 'return_items', 'returns', 'sale_items', 'sales',
-  'stock_transfer_items', 'stock_transfers', 'packing_order_store_items', 'packing_order_stores', 'packing_order_items',
-  'packing_orders', 'product_request_items', 'product_requests', 'store_availability', 'store_stock', 'warehouse_stock',
-  'products', 'categories', 'refresh_tokens', 'password_reset_tokens', 'users', 'stores', 'warehouses', 'settings', 'counters',
-];
-
 export async function resetDb() {
-  await prisma.$executeRawUnsafe(`TRUNCATE ${TABLES.map((t) => `"${t}"`).join(', ')} RESTART IDENTITY CASCADE`);
+  await prisma.$transaction([
+    prisma.notification.deleteMany(),
+    prisma.auditLog.deleteMany(),
+    prisma.stockMovement.deleteMany(),
+    prisma.saleReturnItem.deleteMany(),
+    prisma.saleReturn.deleteMany(),
+    prisma.saleItem.deleteMany(),
+    prisma.sale.deleteMany(),
+    prisma.stockTransferItem.deleteMany(),
+    prisma.stockTransfer.deleteMany(),
+    prisma.packingOrderStoreItem.deleteMany(),
+    prisma.packingOrderStore.deleteMany(),
+    prisma.packingOrderItem.deleteMany(),
+    prisma.packingOrder.deleteMany(),
+    prisma.productRequestItem.deleteMany(),
+    prisma.productRequest.deleteMany(),
+    prisma.storeAvailability.deleteMany(),
+    prisma.storeStock.deleteMany(),
+    prisma.warehouseStock.deleteMany(),
+    prisma.product.deleteMany(),
+    prisma.category.deleteMany(),
+    prisma.refreshToken.deleteMany(),
+    prisma.passwordResetToken.deleteMany(),
+    prisma.user.deleteMany(),
+    prisma.store.deleteMany(),
+    prisma.warehouse.deleteMany(),
+    prisma.setting.deleteMany(),
+    prisma.counter.deleteMany(),
+  ]);
 }
 
 /**
@@ -89,15 +110,28 @@ export const storeQty = async (storeId: string, productId: string) =>
 export const warehouseQty = async (warehouseId: string, productId: string) =>
   (await prisma.warehouseStock.findUnique({ where: { warehouseId_productId: { warehouseId, productId } } })) ?? { quantity: 0, damagedQuantity: 0, reservedQuantity: 0 };
 
-/** Every cached balance must equal the sum of its ledger movements. */
 export async function assertLedgerConsistent() {
-  const rows = await prisma.$queryRaw<{ n: bigint }[]>`
-    SELECT COUNT(*) AS n FROM (
-      SELECT s.quantity AS cached, COALESCE((SELECT SUM(quantity) FROM stock_movements m WHERE m."storeId"=s."storeId" AND m."productId"=s."productId" AND bucket='AVAILABLE'),0) AS ledger FROM store_stock s
-      UNION ALL
-      SELECT s."damagedQuantity", COALESCE((SELECT SUM(quantity) FROM stock_movements m WHERE m."storeId"=s."storeId" AND m."productId"=s."productId" AND bucket='DAMAGED'),0) FROM store_stock s
-      UNION ALL
-      SELECT w.quantity, COALESCE((SELECT SUM(quantity) FROM stock_movements m WHERE m."warehouseId"=w."warehouseId" AND m."productId"=w."productId" AND bucket='AVAILABLE'),0) FROM warehouse_stock w
-    ) x WHERE cached <> ledger`;
-  return Number(rows[0].n);
+  const storeStocks = await prisma.storeStock.findMany();
+  const whStocks = await prisma.warehouseStock.findMany();
+  let discrepancies = 0;
+  for (const s of storeStocks) {
+    const avail = await prisma.stockMovement.aggregate({
+      where: { storeId: s.storeId, productId: s.productId, bucket: 'AVAILABLE' },
+      _sum: { quantity: true },
+    });
+    if (s.quantity !== (avail._sum.quantity ?? 0)) discrepancies++;
+    const dam = await prisma.stockMovement.aggregate({
+      where: { storeId: s.storeId, productId: s.productId, bucket: 'DAMAGED' },
+      _sum: { quantity: true },
+    });
+    if (s.damagedQuantity !== (dam._sum.quantity ?? 0)) discrepancies++;
+  }
+  for (const w of whStocks) {
+    const avail = await prisma.stockMovement.aggregate({
+      where: { warehouseId: w.warehouseId, productId: w.productId, bucket: 'AVAILABLE' },
+      _sum: { quantity: true },
+    });
+    if (w.quantity !== (avail._sum.quantity ?? 0)) discrepancies++;
+  }
+  return discrepancies;
 }

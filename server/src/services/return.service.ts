@@ -78,7 +78,7 @@ export async function createReturn(context: RequestContext, input: z.infer<typeo
     if (!store) throw ApiError.notFound('Store');
     if (store.status !== RecordStatus.ACTIVE) throw ApiError.invalidState('Store is inactive');
 
-    let saleItems: { id: string; productId: string; quantity: number; total: Prisma.Decimal }[] = [];
+    let saleItems: { id: string; productId: string; quantity: number; total: number | Prisma.Decimal }[] = [];
     if (input.saleId) {
       const sale = await tx.sale.findUnique({ where: { id: input.saleId }, include: { items: true } });
       if (!sale || sale.storeId !== storeId) throw ApiError.validation([{ field: 'saleId', message: 'Sale not found for this store' }]);
@@ -101,7 +101,7 @@ export async function createReturn(context: RequestContext, input: z.infer<typeo
         if (item.quantity > remaining) {
           throw ApiError.validation([{ field: `items.${index}.quantity`, message: `Only ${remaining} unit(s) of ${product.name} can still be returned` }]);
         }
-        unitPrice = round2(saleItem.total.div(saleItem.quantity));
+        unitPrice = round2(D(saleItem.total).div(saleItem.quantity));
         saleItemId = saleItem.id;
       }
       planned.push({ product, item, unitPrice, saleItemId });
@@ -114,17 +114,17 @@ export async function createReturn(context: RequestContext, input: z.infer<typeo
         storeId,
         saleId: input.saleId ?? null,
         notes: input.notes,
-        refundAmount,
+        refundAmount: refundAmount.toNumber(),
         clientRequestId: input.clientRequestId,
         createdById: context.user.id,
         items: {
           create: planned.map((p) => ({
-            productId: p.product.id,
-            saleItemId: p.saleItemId,
+            product: { connect: { id: p.product.id } },
+            ...(p.saleItemId ? { saleItem: { connect: { id: p.saleItemId } } } : {}),
             quantity: p.item.quantity,
             condition: p.item.condition as ReturnCondition,
             reason: p.item.reason,
-            unitPrice: p.unitPrice,
+            unitPrice: p.unitPrice.toNumber(),
           })),
         },
       },

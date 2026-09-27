@@ -5,17 +5,12 @@ import { ApiError } from '../utils/apiError';
 import { endOfDay, startOfDay } from '../utils/pagination';
 import { toNumber } from '../utils/money';
 import { RequestContext } from '../types/auth';
-import { getSettings } from './settings.service';
-import { localTs, reportStoreIds, storeSql, storeWhere } from './reportScope';
+import { reportStoreIds, storeWhere } from './reportScope';
 import { categoryWithDescendants } from './category.service';
 import { EXPORT_LIMIT, ExportColumn } from './export.service';
 import { listQuery } from '../validators/common.validator';
 
 export const reportQuery = listQuery.extend({
-  // Reports compute their full result set server-side regardless of page size
-  // (see EXPORT_LIMIT) and the UI renders it as one table rather than paging
-  // through it, so allow a larger page than the 200-row cap used by ordinary
-  // list endpoints.
   limit: z.coerce.number().int().min(1).max(1000).default(20),
   type: z.string().trim().max(40).optional(),
   groupBy: z.enum(['day', 'week', 'month', 'year', 'store', 'product', 'category']).optional(),
@@ -45,18 +40,20 @@ function range(q: ReportQuery, defaultDays = 30) {
   return { start, end };
 }
 
-async function productFilterSql(q: ReportQuery, alias = 'p') {
-  const parts: Prisma.Sql[] = [];
-  if (q.productId) parts.push(Prisma.sql`${Prisma.raw(`${alias}.id`)} = ${q.productId}`);
+async function productWhereInput(q: ReportQuery): Promise<Prisma.ProductWhereInput> {
+  const where: Prisma.ProductWhereInput = {};
+  if (q.productId) where.id = q.productId;
   if (q.categoryId) {
     const ids = await categoryWithDescendants(q.categoryId);
-    parts.push(Prisma.sql`${Prisma.raw(`${alias}."categoryId"`)} IN (${Prisma.join(ids)})`);
+    where.categoryId = { in: ids };
   }
   if (q.search) {
-    const like = `%${q.search}%`;
-    parts.push(Prisma.sql`(${Prisma.raw(`${alias}.name`)} ILIKE ${like} OR ${Prisma.raw(`${alias}.sku`)} ILIKE ${like})`);
+    where.OR = [
+      { name: { contains: q.search, mode: 'insensitive' } },
+      { sku: { contains: q.search, mode: 'insensitive' } },
+    ];
   }
-  return parts.length ? Prisma.join(parts, ' AND ') : Prisma.sql`TRUE`;
+  return where;
 }
 
 const hideCost = (context: RequestContext) => context.user.role === Role.STORE;
@@ -67,7 +64,7 @@ export async function stockReport(context: RequestContext, q: ReportQuery): Prom
   const type = q.type ?? 'current';
   const storeIds = await reportStoreIds(context, q);
   const includeWarehouse = context.user.role === Role.ADMIN && !q.storeId && !q.managerId;
-  const pf = await productFilterSql(q);
+  const pWhere = await productWhereInput(q);
 
   switch (type) {
     case 'current':
@@ -75,32 +72,66 @@ export async function stockReport(context: RequestContext, q: ReportQuery): Prom
     case 'store':
     case 'warehouse':
     case 'damaged': {
-      const low = type === 'low' ? Prisma.sql`AND x.quantity <= p."minimumStock"` : Prisma.empty;
-      const damaged = type === 'damaged' ? Prisma.sql`AND x."damagedQuantity" > 0` : Prisma.empty;
-      const storePart =
-        type === 'warehouse'
-          ? null
-          : Prisma.sql`
-            SELECT st.name AS location, 'STORE' AS "locationType", p.name AS product, p.sku, c.name AS category,
-              x.quantity, x."reservedQuantity" AS reserved, x.quantity - x."reservedQuantity" AS available,
-              x."damagedQuantity" AS damaged, p."minimumStock" AS "minimumStock"
-            FROM store_stock x JOIN products p ON p.id = x."productId" JOIN categories c ON c.id = p."categoryId"
-            JOIN stores st ON st.id = x."storeId"
-            WHERE ${storeSql('x."storeId"', storeIds)} AND ${pf} ${low} ${damaged}`;
-      const warehousePart =
-        (includeWarehouse && type !== 'store') || type === 'warehouse'
-          ? Prisma.sql`
-            SELECT w.name AS location, 'WAREHOUSE' AS "locationType", p.name AS product, p.sku, c.name AS category,
-              x.quantity, x."reservedQuantity" AS reserved, x.quantity - x."reservedQuantity" AS available,
-              x."damagedQuantity" AS damaged, p."minimumStock" AS "minimumStock"
-            FROM warehouse_stock x JOIN products p ON p.id = x."productId" JOIN categories c ON c.id = p."categoryId"
-            JOIN warehouses w ON w.id = x."warehouseId"
-            WHERE ${pf} ${low} ${damaged}`
-          : null;
-      if (type === 'warehouse' && context.user.role !== Role.ADMIN) throw ApiError.forbidden();
-      const parts = [storePart, warehousePart].filter((p): p is Prisma.Sql => p !== null);
-      const rows = await prisma.$queryRaw<Record<string, unknown>[]>`
-        SELECT * FROM (${Prisma.join(parts, ' UNION ALL ')}) r ORDER BY r."locationType", r.location, r.product LIMIT ${EXPORT_LIMIT}`;
+      let storeRows: Record<string, unknown>[] = [];
+      if (type !== 'warehouse') {
+        const storeStock = await prisma.storeStock.findMany({
+          where: {
+            ...storeWhere(storeIds),
+            product: pWhere,
+            ...(type === 'damaged' ? { damagedQuantity: { gt: 0 } } : {}),
+          },
+          include: {
+            store: { select: { name: true } },
+            product: { select: { name: true, sku: true, minimumStock: true, category: { select: { name: true } } } },
+          },
+          take: EXPORT_LIMIT,
+        });
+        storeRows = storeStock
+          .filter((x) => type !== 'low' || x.quantity <= x.product.minimumStock)
+          .map((x) => ({
+            location: x.store.name,
+            locationType: 'STORE',
+            product: x.product.name,
+            sku: x.product.sku,
+            category: x.product.category.name,
+            quantity: x.quantity,
+            reserved: x.reservedQuantity,
+            available: x.quantity - x.reservedQuantity,
+            damaged: x.damagedQuantity,
+            minimumStock: x.product.minimumStock,
+          }));
+      }
+
+      let warehouseRows: Record<string, unknown>[] = [];
+      if ((includeWarehouse && type !== 'store') || type === 'warehouse') {
+        const whStock = await prisma.warehouseStock.findMany({
+          where: {
+            product: pWhere,
+            ...(type === 'damaged' ? { damagedQuantity: { gt: 0 } } : {}),
+          },
+          include: {
+            warehouse: { select: { name: true } },
+            product: { select: { name: true, sku: true, minimumStock: true, category: { select: { name: true } } } },
+          },
+          take: EXPORT_LIMIT,
+        });
+        warehouseRows = whStock
+          .filter((x) => type !== 'low' || x.quantity <= x.product.minimumStock)
+          .map((x) => ({
+            location: x.warehouse.name,
+            locationType: 'WAREHOUSE',
+            product: x.product.name,
+            sku: x.product.sku,
+            category: x.product.category.name,
+            quantity: x.quantity,
+            reserved: x.reservedQuantity,
+            available: x.quantity - x.reservedQuantity,
+            damaged: x.damagedQuantity,
+            minimumStock: x.product.minimumStock,
+          }));
+      }
+
+      const rows = [...storeRows, ...warehouseRows].slice(0, EXPORT_LIMIT);
       const titles: Record<string, string> = {
         current: 'Current Stock',
         low: 'Low Stock',
@@ -132,49 +163,94 @@ export async function stockReport(context: RequestContext, q: ReportQuery): Prom
 
     case 'movement': {
       const { start, end } = range(q);
-      const location = includeWarehouse ? Prisma.sql`(m."warehouseId" IS NOT NULL OR ${storeSql('m."storeId"', storeIds)})` : storeSql('m."storeId"', storeIds);
-      const typeFilter = q.status ? Prisma.sql`AND m.type::text = ${q.status}` : Prisma.empty;
-      const rows = await prisma.$queryRaw<Record<string, unknown>[]>`
-        SELECT m."createdAt" AS date, COALESCE(st.name, w.name) AS location, p.name AS product, p.sku,
-          m.type::text AS type, m.bucket::text AS bucket, m.quantity, m."balanceAfter" AS balance,
-          m."referenceType" AS reference, m.reason, u.name AS "user"
-        FROM stock_movements m JOIN products p ON p.id = m."productId" JOIN users u ON u.id = m."createdById"
-        LEFT JOIN stores st ON st.id = m."storeId" LEFT JOIN warehouses w ON w.id = m."warehouseId"
-        WHERE ${location} AND ${pf} AND m."createdAt" BETWEEN ${start} AND ${end} ${typeFilter}
-        ORDER BY m."createdAt" DESC LIMIT ${EXPORT_LIMIT}`;
+      const movements = await prisma.stockMovement.findMany({
+        where: {
+          createdAt: { gte: start, lte: end },
+          product: pWhere,
+          ...(q.status ? { type: q.status as any } : {}),
+          ...(includeWarehouse
+            ? storeIds ? { OR: [{ warehouseId: { not: null } }, { storeId: { in: storeIds } }] } : {}
+            : storeIds ? { storeId: { in: storeIds } } : { storeId: { not: null } }),
+        },
+        include: {
+          product: { select: { name: true, sku: true } },
+          store: { select: { name: true } },
+          warehouse: { select: { name: true } },
+          createdBy: { select: { name: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: EXPORT_LIMIT,
+      });
+      const rows = movements.map((m) => ({
+        date: m.createdAt,
+        location: m.store?.name ?? m.warehouse?.name ?? 'Unknown',
+        product: m.product.name,
+        sku: m.product.sku,
+        type: String(m.type),
+        bucket: String(m.bucket),
+        quantity: m.quantity,
+        balance: m.balanceAfter,
+        reference: m.referenceType,
+        reason: m.reason,
+        user: m.createdBy.name,
+      }));
       return {
-        title: 'Stock Movement',
+        title: 'Stock Movements',
         columns: [
           col('date', 'Date', 'datetime'),
           col('location', 'Location'),
           col('product', 'Product'),
           col('sku', 'SKU'),
           col('type', 'Type', 'status'),
-          col('bucket', 'Bucket'),
-          col('quantity', 'Qty', 'number'),
-          col('balance', 'Balance', 'number'),
+          col('bucket', 'Bucket', 'status'),
+          col('quantity', 'Quantity', 'number'),
+          col('balance', 'Balance after', 'number'),
           col('reference', 'Reference'),
           col('reason', 'Reason'),
-          col('user', 'User'),
+          col('user', 'Recorded by'),
         ],
         rows,
         summary: {
           movements: rows.length,
-          inbound: rows.filter((r) => Number(r.quantity) > 0).reduce((a, r) => a + Number(r.quantity), 0),
-          outbound: rows.filter((r) => Number(r.quantity) < 0).reduce((a, r) => a - Number(r.quantity), 0),
+          netQuantity: rows.reduce((a, r) => a + Number(r.quantity), 0),
         },
       };
     }
 
-    case 'returned': {
+    case 'returns': {
       const { start, end } = range(q);
-      const rows = await prisma.$queryRaw<Record<string, unknown>[]>`
-        SELECT r."createdAt" AS date, st.name AS store, r."returnNumber" AS "returnNumber", s."invoiceNumber" AS invoice,
-          p.name AS product, p.sku, ri.quantity, ri.condition::text AS condition, ri.reason, ri."unitPrice" * ri.quantity AS refund
-        FROM return_items ri JOIN returns r ON r.id = ri."returnId" JOIN products p ON p.id = ri."productId"
-        JOIN stores st ON st.id = r."storeId" LEFT JOIN sales s ON s.id = r."saleId"
-        WHERE ${storeSql('r."storeId"', storeIds)} AND ${pf} AND r."createdAt" BETWEEN ${start} AND ${end}
-        ORDER BY r."createdAt" DESC LIMIT ${EXPORT_LIMIT}`;
+      const returnItems = await prisma.saleReturnItem.findMany({
+        where: {
+          saleReturn: {
+            createdAt: { gte: start, lte: end },
+            ...(storeIds ? { storeId: { in: storeIds } } : {}),
+          },
+          product: pWhere,
+        },
+        include: {
+          saleReturn: {
+            include: {
+              store: { select: { name: true } },
+              sale: { select: { invoiceNumber: true } },
+            },
+          },
+          product: { select: { name: true, sku: true } },
+        },
+        orderBy: { saleReturn: { createdAt: 'desc' } },
+        take: EXPORT_LIMIT,
+      });
+      const rows = returnItems.map((ri) => ({
+        date: ri.saleReturn.createdAt,
+        store: ri.saleReturn.store.name,
+        returnNumber: ri.saleReturn.returnNumber,
+        invoice: ri.saleReturn.sale?.invoiceNumber ?? '',
+        product: ri.product.name,
+        sku: ri.product.sku,
+        quantity: ri.quantity,
+        condition: String(ri.condition),
+        reason: ri.reason,
+        refund: Number(ri.unitPrice) * ri.quantity,
+      }));
       return {
         title: 'Returned Stock',
         columns: [
@@ -193,37 +269,66 @@ export async function stockReport(context: RequestContext, q: ReportQuery): Prom
         summary: {
           units: rows.reduce((a, r) => a + Number(r.quantity), 0),
           damaged: rows.filter((r) => r.condition === 'DAMAGED').reduce((a, r) => a + Number(r.quantity), 0),
-          refund: rows.reduce((a, r) => a + toNumber(r.refund as Prisma.Decimal), 0),
+          refund: rows.reduce((a, r) => a + Number(r.refund), 0),
         },
       };
     }
 
     case 'valuation': {
-      const cost = hideCost(context) ? Prisma.sql`NULL::numeric` : Prisma.sql`SUM(x.quantity * p."purchasePrice")`;
-      const storePart = Prisma.sql`
-        SELECT st.name AS location, SUM(x.quantity) AS units, ${cost} AS "costValue", SUM(x.quantity * p."sellingPrice") AS "retailValue"
-        FROM store_stock x JOIN products p ON p.id = x."productId" JOIN stores st ON st.id = x."storeId"
-        WHERE ${storeSql('x."storeId"', storeIds)} AND ${pf} GROUP BY st.name`;
-      const warehousePart = Prisma.sql`
-        SELECT w.name AS location, SUM(x.quantity) AS units, ${cost} AS "costValue", SUM(x.quantity * p."sellingPrice") AS "retailValue"
-        FROM warehouse_stock x JOIN products p ON p.id = x."productId" JOIN warehouses w ON w.id = x."warehouseId"
-        WHERE ${pf} GROUP BY w.name`;
-      const rows = await prisma.$queryRaw<Record<string, unknown>[]>`
-        SELECT * FROM (${includeWarehouse ? Prisma.sql`${warehousePart} UNION ALL ${storePart}` : storePart}) r ORDER BY r.location`;
-      const normalized: Record<string, unknown>[] = rows.map((r) => ({ ...r, units: Number(r.units) }));
+      const isCostHidden = hideCost(context);
+      const storeStock = await prisma.storeStock.findMany({
+        where: {
+          ...storeWhere(storeIds),
+          product: pWhere,
+        },
+        include: {
+          store: { select: { name: true } },
+          product: { select: { purchasePrice: true, sellingPrice: true } },
+        },
+      });
+
+      const storeMap = new Map<string, { location: string; units: number; costValue: number; retailValue: number }>();
+      for (const item of storeStock) {
+        const loc = item.store.name;
+        const entry = storeMap.get(loc) ?? { location: loc, units: 0, costValue: 0, retailValue: 0 };
+        entry.units += item.quantity;
+        entry.costValue += item.quantity * Number(item.product.purchasePrice);
+        entry.retailValue += item.quantity * Number(item.product.sellingPrice);
+        storeMap.set(loc, entry);
+      }
+
+      if (includeWarehouse) {
+        const whStock = await prisma.warehouseStock.findMany({
+          where: { product: pWhere },
+          include: {
+            warehouse: { select: { name: true } },
+            product: { select: { purchasePrice: true, sellingPrice: true } },
+          },
+        });
+        for (const item of whStock) {
+          const loc = item.warehouse.name;
+          const entry = storeMap.get(loc) ?? { location: loc, units: 0, costValue: 0, retailValue: 0 };
+          entry.units += item.quantity;
+          entry.costValue += item.quantity * Number(item.product.purchasePrice);
+          entry.retailValue += item.quantity * Number(item.product.sellingPrice);
+          storeMap.set(loc, entry);
+        }
+      }
+
+      const rows = Array.from(storeMap.values()).sort((a, b) => a.location.localeCompare(b.location));
       return {
         title: 'Stock Valuation',
         columns: [
           col('location', 'Location'),
           col('units', 'Units', 'number'),
-          ...(hideCost(context) ? [] : [col('costValue', 'Cost value', 'money')]),
+          ...(isCostHidden ? [] : [col('costValue', 'Cost value', 'money')]),
           col('retailValue', 'Retail value', 'money'),
         ],
-        rows: normalized,
+        rows,
         summary: {
-          units: normalized.reduce((a, r) => a + Number(r.units), 0),
-          costValue: hideCost(context) ? undefined : normalized.reduce((a, r) => a + toNumber(r.costValue as Prisma.Decimal), 0),
-          retailValue: normalized.reduce((a, r) => a + toNumber(r.retailValue as Prisma.Decimal), 0),
+          units: rows.reduce((a, r) => a + Number(r.units), 0),
+          costValue: isCostHidden ? undefined : rows.reduce((a, r) => a + Number(r.costValue), 0),
+          retailValue: rows.reduce((a, r) => a + Number(r.retailValue), 0),
         },
       };
     }
@@ -236,46 +341,163 @@ export async function stockReport(context: RequestContext, q: ReportQuery): Prom
 
 export async function salesReport(context: RequestContext, q: ReportQuery): Promise<Report> {
   const groupBy = q.groupBy ?? 'day';
-  const { tz } = { tz: (await getSettings()).timezone };
   const { start, end } = range(q, groupBy === 'year' ? 365 * 3 : groupBy === 'month' ? 365 : 30);
   const storeIds = await reportStoreIds(context, q);
-  const pf = await productFilterSql(q);
-  const base = Prisma.sql`
-    FROM sale_items si JOIN sales s ON s.id = si."saleId" JOIN products p ON p.id = si."productId"
-    JOIN categories c ON c.id = p."categoryId" JOIN stores st ON st.id = s."storeId"
-    WHERE s.status = 'COMPLETED' AND ${storeSql('s."storeId"', storeIds)} AND ${pf}
-      AND s."createdAt" BETWEEN ${start} AND ${end}`;
-  const measures = Prisma.sql`
-    COUNT(DISTINCT s.id) AS invoices, SUM(si.quantity) AS units,
-    SUM(si.quantity * si."unitPrice") AS gross, SUM(si.discount) AS "lineDiscount", SUM(si.tax) AS tax, SUM(si.total) AS total`;
+  const pWhere = await productWhereInput(q);
 
-  let rows: Record<string, unknown>[];
-  let first: ReportColumn[];
-  if (['day', 'week', 'month', 'year'].includes(groupBy)) {
-    const unit = Prisma.raw(`'${groupBy}'`);
-    rows = await prisma.$queryRaw`
-      SELECT date_trunc(${unit}, ${localTs('s."createdAt"', tz)})::date AS period, ${measures} ${base}
-      GROUP BY 1 ORDER BY 1`;
-    first = [col('period', groupBy === 'day' ? 'Date' : `${groupBy[0].toUpperCase()}${groupBy.slice(1)} starting`, 'date')];
-  } else if (groupBy === 'store') {
-    rows = await prisma.$queryRaw`SELECT st.code, st.name AS store, ${measures} ${base} GROUP BY st.id ORDER BY total DESC`;
-    first = [col('code', 'Code'), col('store', 'Store')];
-  } else if (groupBy === 'product') {
-    rows = await prisma.$queryRaw`
-      SELECT p.sku, p.name AS product, c.name AS category, ${measures} ${base} GROUP BY p.id, c.name ORDER BY total DESC LIMIT ${EXPORT_LIMIT}`;
-    first = [col('sku', 'SKU'), col('product', 'Product'), col('category', 'Category')];
-  } else {
-    rows = await prisma.$queryRaw`SELECT c.code, c.name AS category, ${measures} ${base} GROUP BY c.id ORDER BY total DESC`;
-    first = [col('code', 'Code'), col('category', 'Category')];
+  const saleItems = await prisma.saleItem.findMany({
+    where: {
+      sale: {
+        status: 'COMPLETED',
+        createdAt: { gte: start, lte: end },
+        ...storeWhere(storeIds),
+      },
+      product: pWhere,
+    },
+    include: {
+      sale: { select: { id: true, createdAt: true, storeId: true, store: { select: { code: true, name: true } } } },
+      product: { select: { id: true, sku: true, name: true, category: { select: { id: true, code: true, name: true } } } },
+    },
+  });
+
+  type Bucket = {
+    key: string;
+    label1: string;
+    label2?: string;
+    label3?: string;
+    invoices: Set<string>;
+    units: number;
+    gross: number;
+    lineDiscount: number;
+    tax: number;
+    total: number;
+  };
+  const buckets = new Map<string, Bucket>();
+
+  for (const item of saleItems) {
+    let bKey = '';
+    let l1 = '';
+    let l2: string | undefined;
+    let l3: string | undefined;
+
+    const d = item.sale.createdAt;
+    if (groupBy === 'day') {
+      bKey = d.toISOString().slice(0, 10);
+      l1 = bKey;
+    } else if (groupBy === 'week') {
+      const firstDay = new Date(d);
+      firstDay.setDate(d.getDate() - d.getDay());
+      bKey = firstDay.toISOString().slice(0, 10);
+      l1 = bKey;
+    } else if (groupBy === 'month') {
+      bKey = d.toISOString().slice(0, 7);
+      l1 = bKey;
+    } else if (groupBy === 'year') {
+      bKey = d.toISOString().slice(0, 4);
+      l1 = bKey;
+    } else if (groupBy === 'store') {
+      bKey = item.sale.storeId;
+      l1 = item.sale.store.code;
+      l2 = item.sale.store.name;
+    } else if (groupBy === 'product') {
+      bKey = item.productId;
+      l1 = item.product.sku;
+      l2 = item.product.name;
+      l3 = item.product.category.name;
+    } else {
+      bKey = item.product.category.id;
+      l1 = item.product.category.code;
+      l2 = item.product.category.name;
+    }
+
+    const b = buckets.get(bKey) ?? {
+      key: bKey,
+      label1: l1,
+      label2: l2,
+      label3: l3,
+      invoices: new Set<string>(),
+      units: 0,
+      gross: 0,
+      lineDiscount: 0,
+      tax: 0,
+      total: 0,
+    };
+    b.invoices.add(item.sale.id);
+    b.units += item.quantity;
+    b.gross += item.quantity * Number(item.unitPrice);
+    b.lineDiscount += Number(item.discount);
+    b.tax += Number(item.tax);
+    b.total += Number(item.total);
+    buckets.set(bKey, b);
   }
 
-  const normalized = rows.map((r) => ({ ...r, invoices: Number(r.invoices), units: Number(r.units) }));
-  // Invoice-level discount is not allocated to lines; report it separately.
+  let first: ReportColumn[];
+  let rows: Record<string, unknown>[];
+  if (['day', 'week', 'month', 'year'].includes(groupBy)) {
+    first = [col('period', groupBy === 'day' ? 'Date' : `${groupBy[0].toUpperCase()}${groupBy.slice(1)} starting`, 'date')];
+    rows = Array.from(buckets.values())
+      .sort((a, b) => a.key.localeCompare(b.key))
+      .map((b) => ({
+        period: b.label1,
+        invoices: b.invoices.size,
+        units: b.units,
+        gross: b.gross,
+        lineDiscount: b.lineDiscount,
+        tax: b.tax,
+        total: b.total,
+      }));
+  } else if (groupBy === 'store') {
+    first = [col('code', 'Code'), col('store', 'Store')];
+    rows = Array.from(buckets.values())
+      .sort((a, b) => b.total - a.total)
+      .map((b) => ({
+        code: b.label1,
+        store: b.label2,
+        invoices: b.invoices.size,
+        units: b.units,
+        gross: b.gross,
+        lineDiscount: b.lineDiscount,
+        tax: b.tax,
+        total: b.total,
+      }));
+  } else if (groupBy === 'product') {
+    first = [col('sku', 'SKU'), col('product', 'Product'), col('category', 'Category')];
+    rows = Array.from(buckets.values())
+      .sort((a, b) => b.total - a.total)
+      .slice(0, EXPORT_LIMIT)
+      .map((b) => ({
+        sku: b.label1,
+        product: b.label2,
+        category: b.label3,
+        invoices: b.invoices.size,
+        units: b.units,
+        gross: b.gross,
+        lineDiscount: b.lineDiscount,
+        tax: b.tax,
+        total: b.total,
+      }));
+  } else {
+    first = [col('code', 'Code'), col('category', 'Category')];
+    rows = Array.from(buckets.values())
+      .sort((a, b) => b.total - a.total)
+      .map((b) => ({
+        code: b.label1,
+        category: b.label2,
+        invoices: b.invoices.size,
+        units: b.units,
+        gross: b.gross,
+        lineDiscount: b.lineDiscount,
+        tax: b.tax,
+        total: b.total,
+      }));
+  }
+
   const invoiceTotals = await prisma.sale.aggregate({
     where: { status: 'COMPLETED', ...storeWhere(storeIds), createdAt: { gte: start, lte: end } },
     _sum: { grandTotal: true, discount: true },
     _count: true,
   });
+
   const titles: Record<string, string> = {
     day: 'Daily Sales',
     week: 'Weekly Sales',
@@ -285,6 +507,7 @@ export async function salesReport(context: RequestContext, q: ReportQuery): Prom
     product: 'Product-wise Sales',
     category: 'Category-wise Sales',
   };
+
   return {
     title: titles[groupBy],
     columns: [
@@ -296,12 +519,12 @@ export async function salesReport(context: RequestContext, q: ReportQuery): Prom
       col('tax', 'Tax', 'money'),
       col('total', 'Line total', 'money'),
     ],
-    rows: normalized,
+    rows,
     summary: {
       from: start,
       to: end,
       invoices: invoiceTotals._count,
-      units: normalized.reduce((a, r) => a + r.units, 0),
+      units: rows.reduce((a, r) => a + Number(r.units), 0),
       invoiceDiscount: invoiceTotals._sum.discount ?? 0,
       netSales: invoiceTotals._sum.grandTotal ?? 0,
     },
@@ -314,98 +537,218 @@ export async function operationsReport(context: RequestContext, q: ReportQuery):
   const type = q.type ?? 'requests';
   const { start, end } = range(q, 90);
   const storeIds = await reportStoreIds(context, q);
-  const status = q.status ? Prisma.sql`AND x.status::text = ${q.status}` : Prisma.empty;
 
   switch (type) {
     case 'requests': {
-      const rows = await prisma.$queryRaw<Record<string, unknown>[]>`
-        SELECT x."requestNumber" AS number, st.name AS store, x.status::text AS status, x."createdAt" AS created,
-          x."submittedAt" AS submitted, x."reviewedAt" AS reviewed,
-          COUNT(i.id) AS lines, SUM(i."requestedQuantity") AS requested, SUM(COALESCE(i."approvedQuantity",0)) AS approved
-        FROM product_requests x JOIN stores st ON st.id = x."storeId" LEFT JOIN product_request_items i ON i."requestId" = x.id
-        WHERE ${storeSql('x."storeId"', storeIds)} AND x."createdAt" BETWEEN ${start} AND ${end} ${status}
-        GROUP BY x.id, st.name ORDER BY x."createdAt" DESC LIMIT ${EXPORT_LIMIT}`;
+      const requests = await prisma.productRequest.findMany({
+        where: {
+          ...storeWhere(storeIds),
+          createdAt: { gte: start, lte: end },
+          ...(q.status ? { status: q.status as any } : {}),
+        },
+        include: {
+          store: { select: { name: true } },
+          items: { select: { requestedQuantity: true, approvedQuantity: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: EXPORT_LIMIT,
+      });
+
+      const rows = requests.map((x) => ({
+        number: x.requestNumber,
+        store: x.store.name,
+        status: String(x.status),
+        created: x.createdAt,
+        submitted: x.submittedAt,
+        reviewed: x.reviewedAt,
+        lines: x.items.length,
+        requested: x.items.reduce((sum, i) => sum + i.requestedQuantity, 0),
+        approved: x.items.reduce((sum, i) => sum + (i.approvedQuantity ?? 0), 0),
+      }));
+
       return {
         title: 'Product Requests',
         columns: [
-          col('number', 'Request #'), col('store', 'Store'), col('status', 'Status', 'status'), col('created', 'Created', 'datetime'),
-          col('submitted', 'Submitted', 'datetime'), col('reviewed', 'Reviewed', 'datetime'), col('lines', 'Lines', 'number'),
-          col('requested', 'Requested', 'number'), col('approved', 'Approved', 'number'),
+          col('number', 'Request #'),
+          col('store', 'Store'),
+          col('status', 'Status', 'status'),
+          col('created', 'Created', 'datetime'),
+          col('submitted', 'Submitted', 'datetime'),
+          col('reviewed', 'Reviewed', 'datetime'),
+          col('lines', 'Lines', 'number'),
+          col('requested', 'Requested', 'number'),
+          col('approved', 'Approved', 'number'),
         ],
-        rows: rows.map((r) => ({ ...r, lines: Number(r.lines), requested: Number(r.requested ?? 0), approved: Number(r.approved ?? 0) })),
+        rows,
       };
     }
+
     case 'packing': {
-      const rows = await prisma.$queryRaw<Record<string, unknown>[]>`
-        SELECT x."orderNumber" AS number, st.name AS store, x.status::text AS status, ps.status::text AS "storeStatus",
-          x."createdAt" AS created, x."dispatchedAt" AS dispatched, ps."receivedAt" AS received,
-          SUM(i."allocatedQuantity") AS allocated, SUM(i."packedQuantity") AS packed, SUM(i."dispatchedQuantity") AS "dispatchedQty",
-          SUM(i."receivedQuantity") AS "receivedQty", SUM(i."damagedQuantity") AS damaged
-        FROM packing_orders x JOIN packing_order_stores ps ON ps."packingOrderId" = x.id JOIN stores st ON st.id = ps."storeId"
-        LEFT JOIN packing_order_store_items i ON i."packingOrderStoreId" = ps.id
-        WHERE ${storeSql('ps."storeId"', storeIds)} AND x."createdAt" BETWEEN ${start} AND ${end} ${status}
-          ${context.user.role === Role.STORE ? Prisma.sql`AND x.status <> 'DRAFT'` : Prisma.empty}
-        GROUP BY x.id, ps.id, st.name ORDER BY x."createdAt" DESC LIMIT ${EXPORT_LIMIT}`;
+      const packingStores = await prisma.packingOrderStore.findMany({
+        where: {
+          ...storeWhere(storeIds),
+          packingOrder: {
+            createdAt: { gte: start, lte: end },
+            ...(q.status ? { status: q.status as any } : {}),
+            ...(context.user.role === Role.STORE ? { status: { not: 'DRAFT' } } : {}),
+          },
+        },
+        include: {
+          packingOrder: { select: { orderNumber: true, status: true, createdAt: true, dispatchedAt: true } },
+          store: { select: { name: true } },
+          items: { select: { allocatedQuantity: true, packedQuantity: true, dispatchedQuantity: true, receivedQuantity: true, damagedQuantity: true } },
+        },
+        orderBy: { packingOrder: { createdAt: 'desc' } },
+        take: EXPORT_LIMIT,
+      });
+
+      const rows = packingStores.map((ps) => ({
+        number: ps.packingOrder.orderNumber,
+        store: ps.store.name,
+        status: String(ps.packingOrder.status),
+        storeStatus: String(ps.status),
+        created: ps.packingOrder.createdAt,
+        dispatched: ps.packingOrder.dispatchedAt,
+        received: ps.receivedAt,
+        allocated: ps.items.reduce((sum, i) => sum + i.allocatedQuantity, 0),
+        packed: ps.items.reduce((sum, i) => sum + i.packedQuantity, 0),
+        dispatchedQty: ps.items.reduce((sum, i) => sum + i.dispatchedQuantity, 0),
+        receivedQty: ps.items.reduce((sum, i) => sum + i.receivedQuantity, 0),
+        damaged: ps.items.reduce((sum, i) => sum + i.damagedQuantity, 0),
+      }));
+
       return {
         title: 'Packing Orders',
         columns: [
-          col('number', 'Order #'), col('store', 'Store'), col('status', 'Order status', 'status'), col('storeStatus', 'Store status', 'status'),
-          col('created', 'Created', 'datetime'), col('dispatched', 'Dispatched', 'datetime'), col('received', 'Received', 'datetime'),
-          col('allocated', 'Allocated', 'number'), col('packed', 'Packed', 'number'), col('dispatchedQty', 'Dispatched qty', 'number'),
-          col('receivedQty', 'Received qty', 'number'), col('damaged', 'Damaged', 'number'),
+          col('number', 'Order #'),
+          col('store', 'Store'),
+          col('status', 'Order status', 'status'),
+          col('storeStatus', 'Store status', 'status'),
+          col('created', 'Created', 'datetime'),
+          col('dispatched', 'Dispatched', 'datetime'),
+          col('received', 'Received', 'datetime'),
+          col('allocated', 'Allocated', 'number'),
+          col('packed', 'Packed', 'number'),
+          col('dispatchedQty', 'Dispatched qty', 'number'),
+          col('receivedQty', 'Received qty', 'number'),
+          col('damaged', 'Damaged', 'number'),
         ],
-        rows: rows.map((r) => ({
-          ...r,
-          allocated: Number(r.allocated ?? 0), packed: Number(r.packed ?? 0), dispatchedQty: Number(r.dispatchedQty ?? 0),
-          receivedQty: Number(r.receivedQty ?? 0), damaged: Number(r.damaged ?? 0),
-        })),
+        rows,
       };
     }
+
     case 'transfers': {
-      const scope = storeIds === null ? Prisma.sql`TRUE` : Prisma.sql`(${storeSql('x."toStoreId"', storeIds)} OR ${storeSql('x."fromStoreId"', storeIds)})`;
-      const rows = await prisma.$queryRaw<Record<string, unknown>[]>`
-        SELECT x."transferNumber" AS number, COALESCE(fs.name, w.name) AS "from", ts.name AS "to", x.status::text AS status,
-          x."createdAt" AS created, x."dispatchedAt" AS dispatched, x."receivedAt" AS received,
-          SUM(i."requestedQuantity") AS requested, SUM(COALESCE(i."approvedQuantity",0)) AS approved,
-          SUM(i."dispatchedQuantity") AS "dispatchedQty", SUM(i."receivedQuantity") AS "receivedQty"
-        FROM stock_transfers x JOIN stores ts ON ts.id = x."toStoreId" LEFT JOIN stores fs ON fs.id = x."fromStoreId"
-        LEFT JOIN warehouses w ON w.id = x."fromWarehouseId" LEFT JOIN stock_transfer_items i ON i."transferId" = x.id
-        WHERE ${scope} AND x."createdAt" BETWEEN ${start} AND ${end} ${status}
-        GROUP BY x.id, fs.name, w.name, ts.name ORDER BY x."createdAt" DESC LIMIT ${EXPORT_LIMIT}`;
+      const transfers = await prisma.stockTransfer.findMany({
+        where: {
+          createdAt: { gte: start, lte: end },
+          ...(q.status ? { status: q.status as any } : {}),
+          ...(storeIds ? { OR: [{ toStoreId: { in: storeIds } }, { fromStoreId: { in: storeIds } }] } : {}),
+        },
+        include: {
+          fromStore: { select: { name: true } },
+          fromWarehouse: { select: { name: true } },
+          toStore: { select: { name: true } },
+          items: { select: { requestedQuantity: true, approvedQuantity: true, dispatchedQuantity: true, receivedQuantity: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: EXPORT_LIMIT,
+      });
+
+      const rows = transfers.map((x) => ({
+        number: x.transferNumber,
+        from: x.fromStore?.name ?? x.fromWarehouse?.name ?? 'Central warehouse',
+        to: x.toStore.name,
+        status: String(x.status),
+        created: x.createdAt,
+        dispatched: x.dispatchedAt,
+        received: x.receivedAt,
+        requested: x.items.reduce((sum, i) => sum + i.requestedQuantity, 0),
+        approved: x.items.reduce((sum, i) => sum + (i.approvedQuantity ?? 0), 0),
+        dispatchedQty: x.items.reduce((sum, i) => sum + i.dispatchedQuantity, 0),
+        receivedQty: x.items.reduce((sum, i) => sum + i.receivedQuantity, 0),
+      }));
+
       return {
         title: 'Stock Transfers',
         columns: [
-          col('number', 'Transfer #'), col('from', 'From'), col('to', 'To'), col('status', 'Status', 'status'),
-          col('created', 'Created', 'datetime'), col('dispatched', 'Dispatched', 'datetime'), col('received', 'Received', 'datetime'),
-          col('requested', 'Requested', 'number'), col('approved', 'Approved', 'number'), col('dispatchedQty', 'Dispatched', 'number'),
+          col('number', 'Transfer #'),
+          col('from', 'From'),
+          col('to', 'To'),
+          col('status', 'Status', 'status'),
+          col('created', 'Created', 'datetime'),
+          col('dispatched', 'Dispatched', 'datetime'),
+          col('received', 'Received', 'datetime'),
+          col('requested', 'Requested', 'number'),
+          col('approved', 'Approved', 'number'),
+          col('dispatchedQty', 'Dispatched', 'number'),
           col('receivedQty', 'Received', 'number'),
         ],
-        rows: rows.map((r) => ({
-          ...r, requested: Number(r.requested ?? 0), approved: Number(r.approved ?? 0),
-          dispatchedQty: Number(r.dispatchedQty ?? 0), receivedQty: Number(r.receivedQty ?? 0),
-        })),
+        rows,
       };
     }
+
     case 'pending-receipts': {
-      const rows = await prisma.$queryRaw<Record<string, unknown>[]>`
-        SELECT 'PACKING_ORDER' AS kind, x."orderNumber" AS number, w.name AS "from", st.name AS "to", ps."dispatchedAt" AS dispatched,
-          SUM(i."dispatchedQuantity") AS quantity
-        FROM packing_order_stores ps JOIN packing_orders x ON x.id = ps."packingOrderId" JOIN stores st ON st.id = ps."storeId"
-        JOIN warehouses w ON w.id = x."warehouseId" LEFT JOIN packing_order_store_items i ON i."packingOrderStoreId" = ps.id
-        WHERE ps.status = 'DISPATCHED' AND ${storeSql('ps."storeId"', storeIds)}
-        GROUP BY x.id, ps.id, w.name, st.name
-        UNION ALL
-        SELECT 'TRANSFER' AS kind, x."transferNumber", COALESCE(fs.name, w.name), ts.name, x."dispatchedAt", SUM(i."dispatchedQuantity")
-        FROM stock_transfers x JOIN stores ts ON ts.id = x."toStoreId" LEFT JOIN stores fs ON fs.id = x."fromStoreId"
-        LEFT JOIN warehouses w ON w.id = x."fromWarehouseId" LEFT JOIN stock_transfer_items i ON i."transferId" = x.id
-        WHERE x.status = 'DISPATCHED' AND ${storeSql('x."toStoreId"', storeIds)}
-        GROUP BY x.id, fs.name, w.name, ts.name
-        ORDER BY dispatched ASC NULLS LAST`;
+      const pendingPacking = await prisma.packingOrderStore.findMany({
+        where: {
+          status: 'DISPATCHED',
+          ...storeWhere(storeIds),
+        },
+        include: {
+          packingOrder: { include: { warehouse: { select: { name: true } } } },
+          store: { select: { name: true } },
+          items: { select: { dispatchedQuantity: true } },
+        },
+      });
+
+      const packingRows = pendingPacking.map((ps) => ({
+        kind: 'PACKING_ORDER',
+        number: ps.packingOrder.orderNumber,
+        from: ps.packingOrder.warehouse.name,
+        to: ps.store.name,
+        dispatched: ps.dispatchedAt,
+        quantity: ps.items.reduce((sum, i) => sum + i.dispatchedQuantity, 0),
+      }));
+
+      const pendingTransfers = await prisma.stockTransfer.findMany({
+        where: {
+          status: 'DISPATCHED',
+          ...(storeIds ? { toStoreId: { in: storeIds } } : {}),
+        },
+        include: {
+          fromStore: { select: { name: true } },
+          fromWarehouse: { select: { name: true } },
+          toStore: { select: { name: true } },
+          items: { select: { dispatchedQuantity: true } },
+        },
+      });
+
+      const transferRows = pendingTransfers.map((t) => ({
+        kind: 'TRANSFER',
+        number: t.transferNumber,
+        from: t.fromStore?.name ?? t.fromWarehouse?.name ?? '',
+        to: t.toStore.name,
+        dispatched: t.dispatchedAt,
+        quantity: t.items.reduce((sum, i) => sum + i.dispatchedQuantity, 0),
+      }));
+
+      const rows = [...packingRows, ...transferRows].sort((a, b) => {
+        const da = a.dispatched ? new Date(a.dispatched).getTime() : 0;
+        const db = b.dispatched ? new Date(b.dispatched).getTime() : 0;
+        return da - db;
+      });
+
       return {
         title: 'Pending Receipts',
-        columns: [col('kind', 'Type', 'status'), col('number', 'Document #'), col('from', 'From'), col('to', 'To'), col('dispatched', 'Dispatched', 'datetime'), col('quantity', 'Units in transit', 'number')],
-        rows: rows.map((r) => ({ ...r, quantity: Number(r.quantity ?? 0) })),
-        summary: { documents: rows.length, units: rows.reduce((a, r) => a + Number(r.quantity ?? 0), 0) },
+        columns: [
+          col('kind', 'Type', 'status'),
+          col('number', 'Document #'),
+          col('from', 'From'),
+          col('to', 'To'),
+          col('dispatched', 'Dispatched', 'datetime'),
+          col('quantity', 'Units in transit', 'number'),
+        ],
+        rows,
+        summary: { documents: rows.length, units: rows.reduce((a, r) => a + Number(r.quantity), 0) },
       };
     }
     default:
@@ -418,30 +761,72 @@ export async function operationsReport(context: RequestContext, q: ReportQuery):
 export async function storesReport(context: RequestContext, q: ReportQuery): Promise<Report> {
   const { start, end } = range(q);
   const storeIds = await reportStoreIds(context, q);
-  const rows = await prisma.$queryRaw<Record<string, unknown>[]>`
-    SELECT st.code, st.name AS store, st.city, m.name AS manager, st.status::text AS status,
-      (SELECT COUNT(*) FROM sales s WHERE s."storeId" = st.id AND s.status = 'COMPLETED' AND s."createdAt" BETWEEN ${start} AND ${end}) AS invoices,
-      (SELECT COALESCE(SUM(s."grandTotal"),0) FROM sales s WHERE s."storeId" = st.id AND s.status = 'COMPLETED' AND s."createdAt" BETWEEN ${start} AND ${end}) AS revenue,
-      (SELECT COALESCE(SUM(ss.quantity),0) FROM store_stock ss WHERE ss."storeId" = st.id) AS units,
-      (SELECT COUNT(*) FROM store_stock ss JOIN products p ON p.id = ss."productId" WHERE ss."storeId" = st.id AND ss.quantity <= p."minimumStock") AS "lowStock",
-      (SELECT COALESCE(SUM(ss."damagedQuantity"),0) FROM store_stock ss WHERE ss."storeId" = st.id) AS damaged,
-      (SELECT COUNT(*) FROM product_requests r WHERE r."storeId" = st.id AND r.status IN ('SUBMITTED','UNDER_REVIEW')) AS "pendingRequests"
-    FROM stores st LEFT JOIN users m ON m.id = st."assignedManagerId"
-    WHERE ${storeSql('st.id', storeIds)}
-    ORDER BY revenue DESC`;
-  const normalized: Record<string, unknown>[] = rows.map((r) => ({
-    ...r,
-    invoices: Number(r.invoices), units: Number(r.units), lowStock: Number(r.lowStock), damaged: Number(r.damaged), pendingRequests: Number(r.pendingRequests),
-  }));
+
+  const stores = await prisma.store.findMany({
+    where: storeIds ? { id: { in: storeIds } } : {},
+    include: {
+      assignedManager: { select: { name: true } },
+      stock: {
+        include: {
+          product: { select: { minimumStock: true } },
+        },
+      },
+      sales: {
+        where: { status: 'COMPLETED', createdAt: { gte: start, lte: end } },
+        select: { grandTotal: true },
+      },
+      productRequests: {
+        where: { status: { in: ['SUBMITTED', 'UNDER_REVIEW'] } },
+        select: { id: true },
+      },
+    },
+  });
+
+  const normalized = stores.map((st) => {
+    const invoices = st.sales.length;
+    const revenue = st.sales.reduce((sum, s) => sum + Number(s.grandTotal), 0);
+    const units = st.stock.reduce((sum, s) => sum + s.quantity, 0);
+    const lowStock = st.stock.filter((s) => s.quantity <= s.product.minimumStock).length;
+    const damaged = st.stock.reduce((sum, s) => sum + s.damagedQuantity, 0);
+    const pendingRequests = st.productRequests.length;
+
+    return {
+      code: st.code,
+      store: st.name,
+      city: st.city ?? '',
+      manager: st.assignedManager?.name ?? '',
+      status: String(st.status),
+      invoices,
+      revenue,
+      units,
+      lowStock,
+      damaged,
+      pendingRequests,
+    };
+  }).sort((a, b) => b.revenue - a.revenue);
+
   return {
     title: 'Store Performance',
     columns: [
-      col('code', 'Code'), col('store', 'Store'), col('city', 'City'), col('manager', 'Manager'), col('status', 'Status', 'status'),
-      col('invoices', 'Invoices', 'number'), col('revenue', 'Revenue', 'money'), col('units', 'Units in stock', 'number'),
-      col('lowStock', 'Low-stock lines', 'number'), col('damaged', 'Damaged', 'number'), col('pendingRequests', 'Pending requests', 'number'),
+      col('code', 'Code'),
+      col('store', 'Store'),
+      col('city', 'City'),
+      col('manager', 'Manager'),
+      col('status', 'Status', 'status'),
+      col('invoices', 'Invoices', 'number'),
+      col('revenue', 'Revenue', 'money'),
+      col('units', 'Units in stock', 'number'),
+      col('lowStock', 'Low-stock lines', 'number'),
+      col('damaged', 'Damaged', 'number'),
+      col('pendingRequests', 'Pending requests', 'number'),
     ],
     rows: normalized,
-    summary: { from: start, to: end, stores: normalized.length, revenue: normalized.reduce((a, r) => a + toNumber(r.revenue as Prisma.Decimal), 0) },
+    summary: {
+      from: start,
+      to: end,
+      stores: normalized.length,
+      revenue: normalized.reduce((a, r) => a + Number(r.revenue), 0),
+    },
   };
 }
 
@@ -449,14 +834,13 @@ export async function storesReport(context: RequestContext, q: ReportQuery): Pro
 export function exportColumns(report: Report): ExportColumn<Record<string, unknown>>[] {
   return report.columns.map((c) => ({
     header: c.label,
-    numeric: c.type === 'number' || c.type === 'money',
-    width: c.type === 'datetime' ? 20 : c.type === 'number' || c.type === 'money' ? 12 : 18,
-    value: (row) => {
-      const v = row[c.key];
+    width: c.type === 'money' || c.type === 'number' ? 14 : c.type === 'datetime' ? 22 : 18,
+    numeric: c.type === 'money' || c.type === 'number',
+    value: (r: Record<string, unknown>) => {
+      const v = r[c.key];
       if (v === null || v === undefined) return '';
-      if (c.type === 'money') return toNumber(v as Prisma.Decimal).toFixed(2);
-      if (c.type === 'date' && v instanceof Date) return v.toISOString().slice(0, 10);
       if (v instanceof Date) return v;
+      if (c.type === 'money') return Number(v).toFixed(2);
       if (typeof v === 'object' && 'toNumber' in (v as object)) return (v as Prisma.Decimal).toNumber();
       return v as string | number;
     },

@@ -49,15 +49,20 @@ export async function getCategory(id: string) {
   return category;
 }
 
-/** Returns the id plus every descendant id (for "filter by category incl. subcategories"). */
 export async function categoryWithDescendants(id: string): Promise<string[]> {
-  const rows = await prisma.$queryRaw<{ id: string }[]>`
-    WITH RECURSIVE tree AS (
-      SELECT id FROM categories WHERE id = ${id}
-      UNION ALL
-      SELECT c.id FROM categories c JOIN tree t ON c."parentId" = t.id
-    ) SELECT id FROM tree`;
-  return rows.map((r) => r.id);
+  const results = [id];
+  let currentLevel = [id];
+  while (currentLevel.length > 0) {
+    const children = await prisma.category.findMany({
+      where: { parentId: { in: currentLevel } },
+      select: { id: true },
+    });
+    if (children.length === 0) break;
+    const nextLevel = children.map((c) => c.id);
+    results.push(...nextLevel);
+    currentLevel = nextLevel;
+  }
+  return results;
 }
 
 async function assertValidParent(id: string | null, parentId: string | null | undefined) {

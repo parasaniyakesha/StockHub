@@ -24,7 +24,6 @@ export type Db = PrismaClient | Tx;
  */
 export function transaction<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
   return prisma.$transaction(fn, {
-    isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
     maxWait: 10_000,
     timeout: 30_000,
   });

@@ -37,7 +37,7 @@ const empty = z.object({}).strict();
 
 // ─────────────── Health ───────────────
 router.get('/health', async (_req, res) => {
-  await prisma.$queryRaw`SELECT 1`;
+  await prisma.$runCommandRaw({ ping: 1 });
   res.json({ success: true, message: 'OK', data: { status: 'ok', time: new Date().toISOString() } });
 });
 

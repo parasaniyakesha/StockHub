@@ -76,17 +76,31 @@ export const productRepository = {
    */
   async lowStockIds(scope: StoreScope): Promise<string[]> {
     if (scope.all) {
-      const rows = await prisma.$queryRaw<{ id: string }[]>`
-        SELECT p.id FROM products p
-        LEFT JOIN (SELECT "productId", SUM(quantity) AS qty FROM warehouse_stock GROUP BY "productId") w ON w."productId" = p.id
-        WHERE p.status = 'ACTIVE' AND COALESCE(w.qty, 0) <= p."minimumStock"`;
-      return rows.map((r) => r.id);
+      const products = await prisma.product.findMany({
+        where: { status: 'ACTIVE' },
+        select: { id: true, minimumStock: true, warehouseStock: { select: { quantity: true } } },
+      });
+      return products
+        .filter((p) => {
+          const totalQty = p.warehouseStock.reduce((sum, ws) => sum + ws.quantity, 0);
+          return totalQty <= p.minimumStock;
+        })
+        .map((p) => p.id);
     }
     if (!scope.storeIds.length) return [];
-    const rows = await prisma.$queryRaw<{ id: string }[]>`
-      SELECT DISTINCT p.id FROM products p
-      JOIN store_stock s ON s."productId" = p.id
-      WHERE p.status = 'ACTIVE' AND s."storeId" IN (${Prisma.join(scope.storeIds)}) AND s.quantity <= p."minimumStock"`;
-    return rows.map((r) => r.id);
+    const stock = await prisma.storeStock.findMany({
+      where: {
+        storeId: { in: scope.storeIds },
+        product: { status: 'ACTIVE' },
+      },
+      include: { product: { select: { minimumStock: true } } },
+    });
+    const ids = new Set<string>();
+    for (const s of stock) {
+      if (s.quantity <= s.product.minimumStock) {
+        ids.add(s.productId);
+      }
+    }
+    return Array.from(ids);
   },
 };

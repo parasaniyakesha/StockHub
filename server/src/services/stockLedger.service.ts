@@ -1,4 +1,4 @@
-import { MovementType, Prisma, StockBucket } from '@prisma/client';
+import { MovementType, StockBucket } from '@prisma/client';
 import { Tx } from '../utils/prisma';
 import { ApiError } from '../utils/apiError';
 import { notify, NotificationType } from './notification.service';
@@ -7,8 +7,7 @@ import { getSettings } from './settings.service';
 /**
  * ─────────────────────────── STOCK LEDGER ───────────────────────────
  * The single place where stock balances change. Every change:
- *   1. atomically updates the cached balance with a conditional UPDATE
- *      (so concurrent requests cannot oversell / go negative), and
+ *   1. updates the balance row with validation, and
  *   2. writes a StockMovement row with the signed quantity and balance after.
  * Callers MUST pass a transaction client so the business document (sale,
  * transfer, packing order ...) and its movements commit or roll back together.
@@ -51,20 +50,21 @@ interface BalanceRow {
   damagedQuantity: number;
 }
 
-const table = (loc: StockLocation) =>
-  loc.kind === 'WAREHOUSE' ? Prisma.raw('warehouse_stock') : Prisma.raw('store_stock');
-
-const locationColumn = (loc: StockLocation) =>
-  loc.kind === 'WAREHOUSE' ? Prisma.raw('"warehouseId"') : Prisma.raw('"storeId"');
-
-const locationId = (loc: StockLocation) => (loc.kind === 'WAREHOUSE' ? loc.warehouseId : loc.storeId);
-
 /** Makes sure the balance row exists (quantity 0) without touching an existing one. */
 async function ensureRow(tx: Tx, loc: StockLocation, productId: string) {
-  await tx.$executeRaw`
-    INSERT INTO ${table(loc)} (id, ${locationColumn(loc)}, "productId", quantity, "reservedQuantity", "damagedQuantity", "updatedAt")
-    VALUES (gen_random_uuid(), ${locationId(loc)}, ${productId}, 0, 0, 0, now())
-    ON CONFLICT (${locationColumn(loc)}, "productId") DO NOTHING`;
+  if (loc.kind === 'WAREHOUSE') {
+    await tx.warehouseStock.upsert({
+      where: { warehouseId_productId: { warehouseId: loc.warehouseId, productId } },
+      create: { warehouseId: loc.warehouseId, productId, quantity: 0, reservedQuantity: 0, damagedQuantity: 0 },
+      update: {},
+    });
+  } else {
+    await tx.storeStock.upsert({
+      where: { storeId_productId: { storeId: loc.storeId, productId } },
+      create: { storeId: loc.storeId, productId, quantity: 0, reservedQuantity: 0, damagedQuantity: 0 },
+      update: {},
+    });
+  }
 }
 
 async function productInfo(tx: Tx, productId: string) {
@@ -95,35 +95,75 @@ export async function applyMovement(tx: Tx, input: MovementInput) {
 
   await ensureRow(tx, loc, input.productId);
 
-  let rows: BalanceRow[];
-  if (bucket === StockBucket.AVAILABLE) {
-    // available = quantity - reservedQuantity must stay >= 0 after the change,
-    // unless negative stock is explicitly allowed. Increases are never blocked.
-    rows = await tx.$queryRaw<BalanceRow[]>`
-      UPDATE ${table(loc)}
-      SET quantity = quantity + ${delta},
-          "reservedQuantity" = "reservedQuantity" - ${release},
-          "updatedAt" = now()
-      WHERE ${locationColumn(loc)} = ${locationId(loc)} AND "productId" = ${input.productId}
-        AND "reservedQuantity" - ${release} >= 0
-        AND (${delta} > 0 OR ${allowNegative} OR quantity + ${delta} - ("reservedQuantity" - ${release}) >= 0)
-      RETURNING quantity, "reservedQuantity", "damagedQuantity"`;
+  let balance: BalanceRow;
+  if (loc.kind === 'WAREHOUSE') {
+    const current = await tx.warehouseStock.findUniqueOrThrow({
+      where: { warehouseId_productId: { warehouseId: loc.warehouseId, productId: input.productId } },
+    });
+    if (bucket === StockBucket.AVAILABLE) {
+      if (current.reservedQuantity - release < 0) {
+        throw ApiError.insufficientStock(`Insufficient stock for ${product.name} (${product.sku}) in ${describe(loc)}`);
+      }
+      if (delta < 0 && !allowNegative && current.quantity + delta - (current.reservedQuantity - release) < 0) {
+        throw ApiError.insufficientStock(`Insufficient stock for ${product.name} (${product.sku}) in ${describe(loc)}`);
+      }
+      balance = await tx.warehouseStock.update({
+        where: { id: current.id },
+        data: {
+          quantity: { increment: delta },
+          reservedQuantity: { decrement: release },
+        },
+        select: { quantity: true, reservedQuantity: true, damagedQuantity: true },
+      });
+    } else {
+      if (current.damagedQuantity + delta < 0) {
+        throw ApiError.insufficientStock(
+          `Insufficient damaged stock for ${product.name} (${product.sku}) in ${describe(loc)}`,
+        );
+      }
+      balance = await tx.warehouseStock.update({
+        where: { id: current.id },
+        data: {
+          damagedQuantity: { increment: delta },
+        },
+        select: { quantity: true, reservedQuantity: true, damagedQuantity: true },
+      });
+    }
   } else {
-    rows = await tx.$queryRaw<BalanceRow[]>`
-      UPDATE ${table(loc)}
-      SET "damagedQuantity" = "damagedQuantity" + ${delta}, "updatedAt" = now()
-      WHERE ${locationColumn(loc)} = ${locationId(loc)} AND "productId" = ${input.productId}
-        AND "damagedQuantity" + ${delta} >= 0
-      RETURNING quantity, "reservedQuantity", "damagedQuantity"`;
+    const current = await tx.storeStock.findUniqueOrThrow({
+      where: { storeId_productId: { storeId: loc.storeId, productId: input.productId } },
+    });
+    if (bucket === StockBucket.AVAILABLE) {
+      if (current.reservedQuantity - release < 0) {
+        throw ApiError.insufficientStock(`Insufficient stock for ${product.name} (${product.sku}) in ${describe(loc)}`);
+      }
+      if (delta < 0 && !allowNegative && current.quantity + delta - (current.reservedQuantity - release) < 0) {
+        throw ApiError.insufficientStock(`Insufficient stock for ${product.name} (${product.sku}) in ${describe(loc)}`);
+      }
+      balance = await tx.storeStock.update({
+        where: { id: current.id },
+        data: {
+          quantity: { increment: delta },
+          reservedQuantity: { decrement: release },
+        },
+        select: { quantity: true, reservedQuantity: true, damagedQuantity: true },
+      });
+    } else {
+      if (current.damagedQuantity + delta < 0) {
+        throw ApiError.insufficientStock(
+          `Insufficient damaged stock for ${product.name} (${product.sku}) in ${describe(loc)}`,
+        );
+      }
+      balance = await tx.storeStock.update({
+        where: { id: current.id },
+        data: {
+          damagedQuantity: { increment: delta },
+        },
+        select: { quantity: true, reservedQuantity: true, damagedQuantity: true },
+      });
+    }
   }
 
-  if (!rows.length) {
-    throw ApiError.insufficientStock(
-      `Insufficient ${bucket === StockBucket.DAMAGED ? 'damaged ' : ''}stock for ${product.name} (${product.sku}) in ${describe(loc)}`,
-    );
-  }
-
-  const balance = rows[0];
   const balanceAfter = bucket === StockBucket.AVAILABLE ? balance.quantity : balance.damagedQuantity;
 
   const movement = await tx.stockMovement.create({
@@ -174,27 +214,58 @@ export async function applyMovement(tx: Tx, input: MovementInput) {
 export async function reserve(tx: Tx, loc: StockLocation, productId: string, quantity: number) {
   if (quantity <= 0) return;
   await ensureRow(tx, loc, productId);
-  const rows = await tx.$queryRaw<BalanceRow[]>`
-    UPDATE ${table(loc)}
-    SET "reservedQuantity" = "reservedQuantity" + ${quantity}, "updatedAt" = now()
-    WHERE ${locationColumn(loc)} = ${locationId(loc)} AND "productId" = ${productId}
-      AND quantity - "reservedQuantity" >= ${quantity}
-    RETURNING quantity, "reservedQuantity", "damagedQuantity"`;
-  if (!rows.length) {
-    const product = await productInfo(tx, productId);
-    throw ApiError.insufficientStock(
-      `Not enough available stock of ${product.name} (${product.sku}) in ${describe(loc)} to allocate ${quantity}`,
-    );
+  if (loc.kind === 'WAREHOUSE') {
+    const current = await tx.warehouseStock.findUniqueOrThrow({
+      where: { warehouseId_productId: { warehouseId: loc.warehouseId, productId } },
+    });
+    if (current.quantity - current.reservedQuantity < quantity) {
+      const product = await productInfo(tx, productId);
+      throw ApiError.insufficientStock(
+        `Not enough available stock of ${product.name} (${product.sku}) in ${describe(loc)} to allocate ${quantity}`,
+      );
+    }
+    await tx.warehouseStock.update({
+      where: { id: current.id },
+      data: { reservedQuantity: { increment: quantity } },
+    });
+  } else {
+    const current = await tx.storeStock.findUniqueOrThrow({
+      where: { storeId_productId: { storeId: loc.storeId, productId } },
+    });
+    if (current.quantity - current.reservedQuantity < quantity) {
+      const product = await productInfo(tx, productId);
+      throw ApiError.insufficientStock(
+        `Not enough available stock of ${product.name} (${product.sku}) in ${describe(loc)} to allocate ${quantity}`,
+      );
+    }
+    await tx.storeStock.update({
+      where: { id: current.id },
+      data: { reservedQuantity: { increment: quantity } },
+    });
   }
 }
 
 export async function releaseReservation(tx: Tx, loc: StockLocation, productId: string, quantity: number) {
   if (quantity <= 0) return;
-  const count = await tx.$executeRaw`
-    UPDATE ${table(loc)}
-    SET "reservedQuantity" = GREATEST("reservedQuantity" - ${quantity}, 0), "updatedAt" = now()
-    WHERE ${locationColumn(loc)} = ${locationId(loc)} AND "productId" = ${productId}`;
-  if (!count) throw ApiError.invalidState('No reservation to release');
+  if (loc.kind === 'WAREHOUSE') {
+    const current = await tx.warehouseStock.findUnique({
+      where: { warehouseId_productId: { warehouseId: loc.warehouseId, productId } },
+    });
+    if (!current) throw ApiError.invalidState('No reservation to release');
+    await tx.warehouseStock.update({
+      where: { id: current.id },
+      data: { reservedQuantity: Math.max(0, current.reservedQuantity - quantity) },
+    });
+  } else {
+    const current = await tx.storeStock.findUnique({
+      where: { storeId_productId: { storeId: loc.storeId, productId } },
+    });
+    if (!current) throw ApiError.invalidState('No reservation to release');
+    await tx.storeStock.update({
+      where: { id: current.id },
+      data: { reservedQuantity: Math.max(0, current.reservedQuantity - quantity) },
+    });
+  }
 }
 
 /** Moves quantity from AVAILABLE to DAMAGED at the same location (two movements). */
