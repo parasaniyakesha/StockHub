@@ -69,7 +69,7 @@ export async function createReturn(context: RequestContext, input: z.infer<typeo
   assertStoreAccess(context.scope, storeId);
 
   if (input.clientRequestId) {
-    const existing = await prisma.saleReturn.findUnique({ where: { clientRequestId: input.clientRequestId }, select: { id: true } });
+    const existing = await prisma.saleReturn.findFirst({ where: { clientRequestId: input.clientRequestId }, select: { id: true } });
     if (existing) return getReturn(context, existing.id);
   }
 

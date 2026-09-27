@@ -134,7 +134,7 @@ export async function createRequest(context: RequestContext, input: z.infer<type
   assertStoreAccess(context.scope, storeId);
 
   if (input.clientRequestId) {
-    const existing = await prisma.productRequest.findUnique({ where: { clientRequestId: input.clientRequestId } });
+    const existing = await prisma.productRequest.findFirst({ where: { clientRequestId: input.clientRequestId } });
     if (existing) return loadInScope(context, existing.id);
   }
 

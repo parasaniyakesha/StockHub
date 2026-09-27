@@ -196,7 +196,7 @@ model Product {
   id            String       @id @default(uuid()) @map("_id")
   name          String
   sku           String       @unique
-  barcode       String?      @unique
+  barcode       String?
   categoryId    String
   category      Category     @relation(fields: [categoryId], references: [id])
   brand         String?
@@ -226,6 +226,7 @@ model Product {
   @@index([categoryId])
   @@index([status])
   @@index([name])
+  @@index([barcode])
   @@map("products")
 }
 
@@ -368,7 +369,7 @@ model ProductRequest {
   status          ProductRequestStatus @default(DRAFT)
   notes           String?
   reviewNotes     String?
-  clientRequestId String?              @unique
+  clientRequestId String?
   createdById     String
   reviewedById    String?
   submittedAt     DateTime?
@@ -381,6 +382,7 @@ model ProductRequest {
 
   @@index([storeId, status])
   @@index([status])
+  @@index([clientRequestId])
   @@map("product_requests")
 }
 
@@ -493,7 +495,7 @@ model StockTransfer {
   status          TransferStatus @default(REQUESTED)
   notes           String?
   rejectionReason String?
-  clientRequestId String?        @unique
+  clientRequestId String?
   requestedById   String
   approvedById    String?
   dispatchedById  String?
@@ -510,6 +512,7 @@ model StockTransfer {
   @@index([status])
   @@index([fromStoreId])
   @@index([toStoreId])
+  @@index([clientRequestId])
   @@map("stock_transfers")
 }
 
@@ -545,7 +548,7 @@ model Sale {
   paymentMethod   PaymentMethod
   status          SaleStatus    @default(COMPLETED)
   notes           String?
-  clientRequestId String?       @unique
+  clientRequestId String?
   createdById     String
   createdBy       User          @relation(fields: [createdById], references: [id])
   cancelledAt     DateTime?
@@ -557,6 +560,7 @@ model Sale {
 
   @@index([storeId, createdAt])
   @@index([createdAt])
+  @@index([clientRequestId])
   @@map("sales")
 }
 
@@ -589,7 +593,7 @@ model SaleReturn {
   sale            Sale?    @relation(fields: [saleId], references: [id])
   notes           String?
   refundAmount    Float    @default(0)
-  clientRequestId String?  @unique
+  clientRequestId String?
   createdById     String
   createdBy       User     @relation(fields: [createdById], references: [id])
   createdAt       DateTime @default(now())
@@ -597,6 +601,7 @@ model SaleReturn {
   items SaleReturnItem[]
 
   @@index([storeId, createdAt])
+  @@index([clientRequestId])
   @@map("returns")
 }
 

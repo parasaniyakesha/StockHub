@@ -75,7 +75,7 @@ export async function createSale(context: RequestContext, input: z.infer<typeof 
   assertStoreAccess(context.scope, storeId);
 
   if (input.clientRequestId) {
-    const existing = await prisma.sale.findUnique({ where: { clientRequestId: input.clientRequestId }, select: { id: true, storeId: true } });
+    const existing = await prisma.sale.findFirst({ where: { clientRequestId: input.clientRequestId }, select: { id: true, storeId: true } });
     if (existing) return { sale: await getSale(context, existing.id), duplicate: true };
   }
 

@@ -29,7 +29,7 @@ class LoginController extends GetxController {
 
   Future<void> submit() async {
     errorMessage.value = null;
-    fieldErrors.clear();
+    fieldErrors.value = <String, String>{};
     if (!formKey.currentState!.validate()) return;
     loading.value = true;
     try {
@@ -37,7 +37,7 @@ class LoginController extends GetxController {
       Get.offAllNamed(AppRoutes.dashboard);
     } catch (e) {
       final err = AppException.from(e);
-      fieldErrors.assignAll(err.fieldErrors);
+      fieldErrors.value = Map<String, String>.from(err.fieldErrors);
       if (err.fieldErrors.isEmpty) errorMessage.value = err.message;
     } finally {
       loading.value = false;

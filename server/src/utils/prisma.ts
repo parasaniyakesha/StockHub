@@ -24,7 +24,7 @@ export type Db = PrismaClient | Tx;
  */
 export function transaction<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
   return prisma.$transaction(fn, {
-    maxWait: 10_000,
-    timeout: 30_000,
+    maxWait: 30_000,
+    timeout: 120_000,
   });
 }

@@ -4,7 +4,7 @@ import 'package:dio/dio.dart';
 /// server internals never reach the UI - only [message] and [fieldErrors].
 class AppException implements Exception {
   AppException(this.message, {this.code = 'UNKNOWN', this.statusCode, Map<String, String>? fieldErrors})
-      : fieldErrors = fieldErrors ?? const {};
+      : fieldErrors = fieldErrors != null ? Map<String, String>.from(fieldErrors) : <String, String>{};
 
   final String message;
   final String code;

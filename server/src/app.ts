@@ -17,7 +17,7 @@ export function createApp() {
   const app = express();
 
   app.disable('x-powered-by');
-  if (env.TRUST_PROXY > 0 || env.isProduction) {
+  if (env.TRUST_PROXY > 0 || env.isProduction || process.env.RENDER) {
     app.set('trust proxy', env.TRUST_PROXY > 0 ? env.TRUST_PROXY : 1);
   }
 

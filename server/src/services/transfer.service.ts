@@ -126,7 +126,7 @@ export async function listTransfers(context: RequestContext, q: z.infer<typeof t
 
 export async function createTransfer(context: RequestContext, input: z.infer<typeof createTransferSchema>) {
   if (input.clientRequestId) {
-    const existing = await prisma.stockTransfer.findUnique({ where: { clientRequestId: input.clientRequestId }, select: { id: true } });
+    const existing = await prisma.stockTransfer.findFirst({ where: { clientRequestId: input.clientRequestId }, select: { id: true } });
     if (existing) return getTransfer(context, existing.id);
   }
 
