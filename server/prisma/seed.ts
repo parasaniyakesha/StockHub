@@ -26,6 +26,9 @@ if (process.env.NODE_ENV === 'production') {
   process.exit(1);
 }
 
+
+
+
 const adminEmail = (process.env.SEED_ADMIN_EMAIL ?? 'admin@gmail.com').toLowerCase();
 const adminPassword = process.env.SEED_ADMIN_PASSWORD || `Adm!${randomToken(9)}9a`;
 const defaultPassword = process.env.SEED_DEFAULT_PASSWORD || `Usr!${randomToken(9)}9a`;
